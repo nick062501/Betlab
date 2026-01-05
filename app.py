@@ -78,8 +78,8 @@ st.divider()
 if st.button("Analyze NBA"):
     st.success("Analysis running...")
     pid = nba_players.find_players_by_full_name(player)
-        if not pid:
-            st.error("Player not found")
+if not pid:
+        st.error("Player not found")
         else:
             pid = pid[0]["id"]
             df = playergamelog.PlayerGameLog(player_id=pid, season=season).get_data_frames()[0]
