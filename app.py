@@ -1,122 +1,116 @@
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-# nba_api (works on Streamlit Cloud if in requirements.txt)
-from nba_api.stats.static import players as nba_players
-from nba_api.stats.static import teams as nba_teams
-from nba_api.stats.endpoints import (
-    playergamelog,
-    commonplayerinfo,
-    scoreboardv2,
-    leaguedashteamstats,
-)
+# nba_api is optional at runtime (but recommended). We guard calls with try/except.
+try:
+    from nba_api.stats.endpoints import (
+        leaguedashteamstats,
+        playergamelog,
+        scoreboardv2,
+    )
+    from nba_api.stats.static import players as nba_players
+    from nba_api.stats.static import teams as nba_teams
+    NBA_API_AVAILABLE = True
+except Exception:
+    NBA_API_AVAILABLE = False
 
-# -----------------------------
-# App Config
-# -----------------------------
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+
+# ----------------------------
+# App config
+# ----------------------------
 st.set_page_config(page_title="BetLab — NBA & NFL Props (v2)", page_icon="📊", layout="centered")
 
-# -----------------------------
-# Helpers: keys / formatting
-# -----------------------------
-def K(prefix: str, name: str) -> str:
+
+# ----------------------------
+# Helpers (keys, timeouts, math)
+# ----------------------------
+def k(prefix: str, name: str) -> str:
+    """Unique streamlit key generator to avoid DuplicateElementId issues."""
     return f"{prefix}__{name}"
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
 
-def american_to_implied_prob(odds: Optional[float]) -> Optional[float]:
+def american_to_implied_prob(odds: Optional[int]) -> Optional[float]:
     if odds is None:
         return None
     try:
-        odds = float(odds)
+        o = int(odds)
     except Exception:
         return None
-    if odds == 0:
+    if o == 0:
         return None
-    if odds < 0:
-        return (-odds) / ((-odds) + 100.0)
-    return 100.0 / (odds + 100.0)
+    if o > 0:
+        return 100.0 / (o + 100.0)
+    return (-o) / ((-o) + 100.0)
 
-def normal_cdf(z: float) -> float:
-    # Standard normal CDF via erf (no SciPy needed)
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
-def prob_over_line(mu: float, sigma: float, line: float) -> float:
-    # P(X > line) where X ~ Normal(mu, sigma)
-    sigma = max(0.01, sigma)
-    z = (line - mu) / sigma
+def normal_cdf(x: float) -> float:
+    """Standard normal CDF without scipy."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def prob_over(line: float, mean: float, sd: float) -> float:
+    sd = max(sd, 1e-6)
+    # P(X > line) where X~N(mean, sd)
+    z = (line - mean) / sd
     return 1.0 - normal_cdf(z)
 
-def safe_float(x, default=None):
-    try:
-        return float(x)
-    except Exception:
-        return default
 
-# -----------------------------
-# NBA: team & matchup autofill
-# -----------------------------
-@st.cache_data(ttl=60 * 60)
-def nba_id_to_name_map() -> Dict[int, str]:
-    return {t["id"]: t["full_name"] for t in nba_teams.get_teams()}
+def safe_call(fn, timeout_sec: float = 8.0, *args, **kwargs):
+    """
+    Runs a function in a separate thread with a hard timeout.
+    If it times out or errors, returns (False, None, "error/timeout message").
+    """
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn, *args, **kwargs)
+        try:
+            result = fut.result(timeout=timeout_sec)
+            return True, result, ""
+        except FuturesTimeoutError:
+            return False, None, f"Timed out after {timeout_sec:.0f}s"
+        except Exception as e:
+            return False, None, f"{type(e).__name__}: {e}"
 
-@st.cache_data(ttl=60 * 60)
-def nba_name_to_id_map() -> Dict[str, int]:
-    return {t["full_name"]: t["id"] for t in nba_teams.get_teams()}
 
-@st.cache_data(ttl=60 * 60)
-def nba_get_player_id(full_name: str) -> Optional[int]:
-    matches = nba_players.find_players_by_full_name(full_name.strip())
-    if not matches:
-        return None
-    # best match first
-    return matches[0]["id"]
+# ----------------------------
+# NBA API wrappers (cached + safe)
+# ----------------------------
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def nba_player_lookup_df() -> pd.DataFrame:
+    if not NBA_API_AVAILABLE:
+        return pd.DataFrame()
+    plist = nba_players.get_players()
+    df = pd.DataFrame(plist)
+    # Keep common name fields
+    return df[["id", "full_name", "first_name", "last_name", "is_active"]].copy()
 
-@st.cache_data(ttl=60 * 60)
-def nba_get_player_team_id(player_id: int) -> Optional[int]:
-    df = commonplayerinfo.CommonPlayerInfo(player_id=player_id).get_data_frames()[0]
-    if df.empty:
-        return None
-    tid = df.loc[0, "TEAM_ID"]
-    if pd.isna(tid):
-        return None
-    return int(tid)
 
-@st.cache_data(ttl=60 * 10)
-def nba_today_scoreboard_df() -> pd.DataFrame:
-    # Using local "today" — good enough for 99% usage.
-    # If you want, you can add a date override in UI later.
-    game_date = datetime.now().strftime("%m/%d/%Y")
-    games = scoreboardv2.ScoreboardV2(game_date=game_date).get_data_frames()[0]
-    return games
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def nba_teams_df() -> pd.DataFrame:
+    if not NBA_API_AVAILABLE:
+        return pd.DataFrame()
+    tlist = nba_teams.get_teams()
+    df = pd.DataFrame(tlist)
+    return df[["id", "full_name", "abbreviation", "nickname", "city", "state"]].copy()
 
-def nba_find_today_opponent_team_id(player_team_id: int) -> Optional[int]:
-    games = nba_today_scoreboard_df()
-    if games.empty:
-        return None
-    row = games[(games["HOME_TEAM_ID"] == player_team_id) | (games["VISITOR_TEAM_ID"] == player_team_id)]
-    if row.empty:
-        return None
-    r = row.iloc[0]
-    if int(r["HOME_TEAM_ID"]) == int(player_team_id):
-        return int(r["VISITOR_TEAM_ID"])
-    return int(r["HOME_TEAM_ID"])
 
-# -----------------------------
-# NBA: Team defense + pace (auto)
-# -----------------------------
-@st.cache_data(ttl=60 * 60)
+@st.cache_data(ttl=60 * 60, show_spinner=False)
 def nba_team_defense_pace(season: str) -> pd.DataFrame:
     """
-    Returns team stats with DEF_RATING and PACE and their ranks.
-    Uses leaguedashteamstats (works reliably on nba_api).
+    Team DEF_RATING (lower=better) and PACE (higher=faster).
+    Cached. Wrapped by safe_call at runtime.
     """
+    if not NBA_API_AVAILABLE:
+        return pd.DataFrame()
+
     df = leaguedashteamstats.LeagueDashTeamStats(
         season=season,
         season_type_all_star="Regular Season",
@@ -124,650 +118,670 @@ def nba_team_defense_pace(season: str) -> pd.DataFrame:
         measure_type_detailed_defense="Base",
     ).get_data_frames()[0]
 
-    # Columns typically include: TEAM_ID, TEAM_NAME, DEF_RATING, PACE
     if "DEF_RATING" not in df.columns or "PACE" not in df.columns:
         return pd.DataFrame()
 
     out = df[["TEAM_ID", "TEAM_NAME", "DEF_RATING", "PACE"]].copy()
-
-    # Lower DEF_RATING = better defense
     out["DEF_RANK"] = out["DEF_RATING"].rank(method="min", ascending=True).astype(int)
-    # Higher pace = faster
     out["PACE_RANK"] = out["PACE"].rank(method="min", ascending=False).astype(int)
-    out = out.sort_values("DEF_RANK")
     return out
 
-def categorize_rank(rank: Optional[int], total: int = 30) -> str:
-    if rank is None:
-        return "Unknown"
-    if rank <= 5:
-        return "Elite (Top 5)"
-    if rank <= 10:
-        return "Strong (6-10)"
-    if rank <= 20:
-        return "Average (11-20)"
-    return "Weak (21-30)"
 
-# -----------------------------
-# NBA: Player game logs + stats
-# -----------------------------
-NBA_MARKETS = {
-    "PTS": ("PTS",),
-    "REB": ("REB",),
-    "AST": ("AST",),
-    "3PM": ("FG3M",),
-    "PRA": ("PTS", "REB", "AST"),
-    "PR": ("PTS", "REB"),
-    "PA": ("PTS", "AST"),
-}
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def nba_today_scoreboard_df() -> pd.DataFrame:
+    """
+    Safe-ish scoreboard. Cached short. Wrapped by safe_call at runtime.
+    """
+    if not NBA_API_AVAILABLE:
+        return pd.DataFrame()
+    game_date = datetime.now().strftime("%m/%d/%Y")
+    return scoreboardv2.ScoreboardV2(game_date=game_date).get_data_frames()[0]
 
-def compute_market_series(df: pd.DataFrame, market: str) -> pd.Series:
-    cols = NBA_MARKETS.get(market, ("PTS",))
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        return pd.Series(dtype=float)
-    s = df[list(cols)].sum(axis=1)
-    return pd.to_numeric(s, errors="coerce").dropna()
 
-@st.cache_data(ttl=60 * 20)
-def nba_get_player_gamelog(player_id: int, season: str) -> pd.DataFrame:
-    df = playergamelog.PlayerGameLog(player_id=player_id, season=season).get_data_frames()[0]
-    # Newest first typically
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def nba_player_gamelog(player_id: int, season: str, season_type: str) -> pd.DataFrame:
+    """
+    Player game log. Cached. Wrapped by safe_call at runtime.
+    """
+    if not NBA_API_AVAILABLE:
+        return pd.DataFrame()
+    df = playergamelog.PlayerGameLog(
+        player_id=player_id,
+        season=season,
+        season_type_all_star=season_type,
+    ).get_data_frames()[0]
     return df
 
-def hit_rate(series: pd.Series, line: float, side: str) -> float:
-    if series.empty:
-        return 0.0
-    if side.lower() == "over":
-        return float((series > line).mean())
-    return float((series < line).mean())
 
-# -----------------------------
-# Heuristic adjustments (simple + controllable)
-# -----------------------------
-def defense_category_multiplier(cat: str, side: str) -> float:
-    # cat describes opponent defense quality against your prop
-    # Over is harder vs elite defense; Under is easier vs elite defense
-    cat = cat.lower()
-    side = side.lower()
-    if side == "over":
-        if "elite" in cat:
-            return 0.94
-        if "strong" in cat:
-            return 0.97
-        if "average" in cat:
-            return 1.00
-        if "weak" in cat:
-            return 1.04
-        return 1.00
+def find_player_id_by_name(full_name: str) -> Optional[int]:
+    df = nba_player_lookup_df()
+    if df.empty:
+        return None
+    m = df[df["full_name"].str.lower() == full_name.strip().lower()]
+    if m.empty:
+        # light fuzzy: contains both first and last
+        parts = full_name.strip().lower().split()
+        if len(parts) >= 2:
+            first, last = parts[0], parts[-1]
+            m = df[
+                df["full_name"].str.lower().str.contains(first)
+                & df["full_name"].str.lower().str.contains(last)
+            ]
+    if m.empty:
+        return None
+    return int(m.iloc[0]["id"])
+
+
+def extract_team_id_from_gamelog(df: pd.DataFrame) -> Optional[int]:
+    # PlayerGameLog includes "Team_ID" sometimes; if not, infer from "MATCHUP" via abbreviation map.
+    if df is None or df.empty:
+        return None
+    for col in ["Team_ID", "TEAM_ID", "team_id"]:
+        if col in df.columns:
+            try:
+                return int(df.iloc[0][col])
+            except Exception:
+                pass
+
+    # Fallback: parse MATCHUP abbreviation
+    if "MATCHUP" not in df.columns:
+        return None
+    matchup = str(df.iloc[0]["MATCHUP"])
+    # Example: "GSW vs LAL" or "GSW @ LAL"
+    abbr = matchup.split()[0].strip()
+    tdf = nba_teams_df()
+    if tdf.empty:
+        return None
+    row = tdf[tdf["abbreviation"] == abbr]
+    if row.empty:
+        return None
+    return int(row.iloc[0]["id"])
+
+
+def nba_find_today_opponent_team_id(player_team_id: int) -> Optional[int]:
+    ok, games, _err = safe_call(nba_today_scoreboard_df, 6.0)
+    if (not ok) or games is None or games.empty:
+        return None
+    row = games[(games["HOME_TEAM_ID"] == player_team_id) | (games["VISITOR_TEAM_ID"] == player_team_id)]
+    if row.empty:
+        return None
+    r = row.iloc[0]
+    return int(r["VISITOR_TEAM_ID"]) if int(r["HOME_TEAM_ID"]) == int(player_team_id) else int(r["HOME_TEAM_ID"])
+
+
+# ----------------------------
+# Model logic (simple, fast, practical)
+# ----------------------------
+@dataclass
+class NBAContext:
+    season: str
+    market: str
+    line: float
+    pick_over: bool
+    odds: Optional[int]
+    games_recent: int
+    weight_recent: float  # 0..1
+
+    # opponent context
+    defense_vs_pos: str
+    overall_def: str
+    pace: str
+    b2b: str
+    blowout: str
+
+    # minutes / usage
+    expected_minutes: int
+    minutes_vol: str
+    usage_bump: str
+    teammates_out: int
+
+    # injuries text
+    injury_notes: str
+
+    approved_only: bool
+    add_to_card: bool
+
+
+def adjust_mean_for_context(base_mean: float, ctx: NBAContext) -> float:
+    """
+    Heuristic adjustments that are:
+    - transparent
+    - fast
+    - user-controllable
+    """
+    mean = base_mean
+
+    # Defense vs position
+    dvp_adj = {
+        "Elite (Top 5)": -0.08,
+        "Good (6-10)": -0.05,
+        "Average (11-20)": 0.00,
+        "Weak (21-25)": +0.05,
+        "Bad (26-30)": +0.08,
+    }.get(ctx.defense_vs_pos, 0.0)
+
+    # Overall defense
+    od_adj = {
+        "Elite (Top 5)": -0.06,
+        "Good (6-10)": -0.04,
+        "Average (11-20)": 0.00,
+        "Weak (21-25)": +0.04,
+        "Bad (26-30)": +0.06,
+    }.get(ctx.overall_def, 0.0)
+
+    # Pace
+    pace_adj = {
+        "Fast": +0.05,
+        "Average": 0.00,
+        "Slow": -0.05,
+    }.get(ctx.pace, 0.0)
+
+    # Back-to-back
+    b2b_adj = {"Yes": -0.03, "No": 0.0}.get(ctx.b2b, 0.0)
+
+    # Blowout risk reduces ceiling + minutes
+    blow_adj = {"Low": 0.0, "Medium": -0.02, "High": -0.05}.get(ctx.blowout, 0.0)
+
+    # Usage bump
+    usage_adj = {
+        "None": 0.0,
+        "Small": +0.03,
+        "Medium": +0.06,
+        "Large": +0.10,
+    }.get(ctx.usage_bump, 0.0)
+
+    # Teammates out
+    team_out_adj = min(ctx.teammates_out, 5) * 0.01
+
+    # Apply multiplicative adjustments to mean
+    mult = 1.0 + dvp_adj + od_adj + pace_adj + b2b_adj + blow_adj + usage_adj + team_out_adj
+    mean *= mult
+
+    # Minutes scaling (relative to a baseline 34)
+    mean *= (ctx.expected_minutes / 34.0)
+
+    return mean
+
+
+def estimate_sd_from_logs(values: np.ndarray) -> float:
+    if len(values) < 3:
+        return float(np.std(values)) if len(values) > 0 else 1.0
+    sd = float(np.std(values, ddof=1))
+    return max(sd, 1.0)
+
+
+def analyze_nba_prop(player_name: str, ctx: NBAContext, season_type: str = "Regular Season") -> Dict[str, Any]:
+    """
+    Returns analysis dict. All API calls are safe_call guarded.
+    """
+    result: Dict[str, Any] = {"ok": True, "errors": []}
+
+    if not NBA_API_AVAILABLE:
+        result["ok"] = False
+        result["errors"].append("nba_api not available. Add nba_api to requirements.txt.")
+        return result
+
+    pid = find_player_id_by_name(player_name)
+    if pid is None:
+        result["ok"] = False
+        result["errors"].append("Player not found. Try full name exactly (e.g., 'Stephen Curry').")
+        return result
+
+    # Fetch game logs safely (this is the most valuable part)
+    ok, glog, err = safe_call(nba_player_gamelog, 10.0, pid, ctx.season, season_type)
+    if not ok or glog is None or glog.empty:
+        result["ok"] = False
+        result["errors"].append(f"Could not fetch game logs. {err}")
+        return result
+
+    # Make sure newest first
+    if "GAME_DATE" in glog.columns:
+        glog = glog.sort_values("GAME_DATE", ascending=False)
+
+    market_map = {
+        "PTS": "PTS",
+        "REB": "REB",
+        "AST": "AST",
+        "PRA": None,  # computed
+        "PR": None,
+        "PA": None,
+        "RA": None,
+        "3PM": "FG3M" if "FG3M" in glog.columns else None,
+    }
+
+    market = ctx.market
+    if market in ["PRA", "PR", "PA", "RA"]:
+        # build composite
+        need = {
+            "PRA": ["PTS", "REB", "AST"],
+            "PR": ["PTS", "REB"],
+            "PA": ["PTS", "AST"],
+            "RA": ["REB", "AST"],
+        }[market]
+        for c in need:
+            if c not in glog.columns:
+                result["ok"] = False
+                result["errors"].append(f"Missing stat column {c} in logs.")
+                return result
+        vals = glog[need].sum(axis=1).to_numpy(dtype=float)
+        stat_label = "+".join(need)
     else:
-        # for under picks, invert slightly
-        if "elite" in cat:
-            return 1.04
-        if "strong" in cat:
-            return 1.02
-        if "average" in cat:
-            return 1.00
-        if "weak" in cat:
-            return 0.96
-        return 1.00
+        col = market_map.get(market, None)
+        if col is None or col not in glog.columns:
+            result["ok"] = False
+            result["errors"].append(f"Market '{market}' not supported from logs.")
+            return result
+        vals = glog[col].to_numpy(dtype=float)
+        stat_label = col
 
-def pace_multiplier(pace_choice: str) -> float:
-    p = pace_choice.lower()
-    if "fast" in p:
-        return 1.03
-    if "slow" in p:
-        return 0.97
-    return 1.00
+    # Recent + season blends
+    recent_n = max(3, min(int(ctx.games_recent), len(vals)))
+    recent_vals = vals[:recent_n]
+    season_vals = vals
 
-def blowout_minutes_multiplier(blowout_risk: str) -> float:
-    r = blowout_risk.lower()
-    if "high" in r:
-        return 0.94
-    if "medium" in r:
-        return 0.97
-    return 1.00
+    recent_mean = float(np.mean(recent_vals)) if len(recent_vals) else float(np.mean(season_vals))
+    season_mean = float(np.mean(season_vals))
 
-def b2b_multiplier(is_b2b: str) -> float:
-    t = is_b2b.lower()
-    if t.startswith("yes"):
-        return 0.98
-    return 1.00
+    w = float(np.clip(ctx.weight_recent, 0.0, 1.0))
+    base_mean = w * recent_mean + (1.0 - w) * season_mean
 
-def usage_bump_multiplier(bump: str) -> float:
-    b = bump.lower()
-    if "major" in b:
-        return 1.07
-    if "some" in b:
-        return 1.03
-    return 1.00
+    # SD from recent first, fallback to season
+    sd = estimate_sd_from_logs(recent_vals) if len(recent_vals) >= 3 else estimate_sd_from_logs(season_vals)
 
-def minutes_sigma_multiplier(vol: str) -> float:
-    v = vol.lower()
-    if "high" in v:
-        return 1.18
-    if "medium" in v:
-        return 1.08
-    return 1.00
+    # Context adjustment
+    adj_mean = adjust_mean_for_context(base_mean, ctx)
 
-# -----------------------------
-# Daily Card storage
-# -----------------------------
-if "daily_card" not in st.session_state:
-    st.session_state.daily_card = []
+    p_over = prob_over(ctx.line, adj_mean, sd)
+    p_pick = p_over if ctx.pick_over else (1.0 - p_over)
 
-def add_to_daily_card(entry: Dict[str, Any]):
-    st.session_state.daily_card.append(entry)
+    implied = american_to_implied_prob(ctx.odds) if ctx.odds is not None else None
+    edge = (p_pick - implied) if (implied is not None) else None
 
-# -----------------------------
-# UI Header
-# -----------------------------
+    # Approval logic (simple + transparent)
+    approval = True
+    reasons = []
+    if ctx.minutes_vol == "High":
+        approval = False
+        reasons.append("Minutes volatility is High.")
+    if ctx.blowout == "High":
+        reasons.append("Blowout risk High (minutes risk).")
+    if ctx.expected_minutes < 28:
+        reasons.append("Expected minutes < 28 (low volume).")
+    if edge is not None and edge < 0.02:
+        reasons.append("Edge vs implied is small (<2%).")
+    if edge is not None and edge < 0:
+        approval = False
+        reasons.append("Negative edge vs implied.")
+
+    result.update(
+        {
+            "player_id": pid,
+            "stat_label": stat_label,
+            "recent_n": recent_n,
+            "recent_mean": recent_mean,
+            "season_mean": season_mean,
+            "base_mean": base_mean,
+            "adj_mean": adj_mean,
+            "sd": sd,
+            "p_over": p_over,
+            "p_pick": p_pick,
+            "implied": implied,
+            "edge": edge,
+            "approved": approval,
+            "reasons": reasons,
+            "last_10": list(map(float, vals[:10])),
+        }
+    )
+    return result
+
+
+# ----------------------------
+# Streamlit UI
+# ----------------------------
 st.title("📊 BetLab — NBA & NFL Props (v2)")
-st.caption("Decision support tool. Betting involves risk. Focus on disciplined staking and only 2–3 high-quality bets/day.")
+st.caption("Decision support tool. Betting involves risk. Use disciplined staking and focus on 2–3 high-quality bets/day.")
 
 tabs = st.tabs(["🏀 NBA", "🏈 NFL", "⚡ Live (2H)", "🧾 Daily Card", "⚙️ Settings"])
 
-# =========================================================
+if "daily_card" not in st.session_state:
+    st.session_state.daily_card = []  # list of dicts
+
+
+# ----------------------------
+# Settings
+# ----------------------------
+with tabs[4]:
+    st.subheader("Settings")
+
+    fast_boot = st.checkbox(
+        "Fast Boot Mode (recommended on Streamlit Cloud)",
+        value=True,
+        help="Prevents slow API calls during page load. Analysis still works when you click Analyze.",
+        key=k("settings", "fast_boot"),
+    )
+
+    api_timeout = st.slider(
+        "API timeout (seconds)",
+        min_value=4,
+        max_value=20,
+        value=10,
+        help="Hard timeout for nba_api calls. Lower = faster fail instead of hanging.",
+        key=k("settings", "api_timeout"),
+    )
+
+    st.info(
+        "If the app ever loads slowly, keep Fast Boot ON and reduce API timeout to ~8–10s."
+    )
+
+    st.write("---")
+    st.write("If you deploy on Streamlit Cloud, make sure your `requirements.txt` includes:")
+    st.code("streamlit\npandas\nnumpy\nnba_api\nrequests\n", language="text")
+
+
+# ----------------------------
 # NBA TAB
-# =========================================================
+# ----------------------------
 with tabs[0]:
     prefix = "nba"
 
-    st.subheader("NBA Prop Analyzer (Auto Opponent + Defense + Minutes/Usage + Approved Filter)")
+    st.subheader("NBA Prop Analyzer (Defense + Minutes/Usage + Approved Filter)")
+    if not NBA_API_AVAILABLE:
+        st.warning("nba_api not detected in this environment. Add it to requirements.txt on Streamlit Cloud.")
 
-    colA, colB = st.columns(2)
-    with colA:
-        player_name = st.text_input("Player (full name)", value="Stephen Curry", key=K(prefix, "player_name"))
-        season = st.text_input("Season (NBA API format)", value="2025-26", key=K(prefix, "season"))
-        market = st.selectbox("Market", list(NBA_MARKETS.keys()), index=0, key=K(prefix, "market"))
+    # Form prevents reruns while you change controls
+    with st.form(key=k(prefix, "form")):
+        col1, col2 = st.columns([2, 1])
 
-    with colB:
-        line = st.number_input("Prop line", value=18.5, step=0.5, key=K(prefix, "line"))
-        side = st.selectbox("Pick side", ["Over", "Under"], key=K(prefix, "side"))
-        odds_str = st.text_input("Odds (optional, American)", value="-110", key=K(prefix, "odds_str"))
-        odds = safe_float(odds_str, default=None)
+        with col1:
+            player_name = st.text_input(
+                "Player (full name)",
+                value="Stephen Curry",
+                key=k(prefix, "player_name"),
+            )
 
-    st.divider()
+        with col2:
+            season = st.text_input(
+                "Season (NBA API format)",
+                value="2025-26",
+                help="Example: 2025-26",
+                key=k(prefix, "season"),
+            )
 
-    # Controls
-    games_used = st.slider("Games used (recent)", min_value=5, max_value=30, value=21, key=K(prefix, "games_used"))
-    weight_recent = st.slider("Weight: recent vs season (0=season, 100=recent)", 0, 100, 70, key=K(prefix, "weight_recent"))
-    show_only_approved = st.checkbox("Show only Approved plays", value=False, key=K(prefix, "show_only_approved"))
+        market = st.selectbox(
+            "Market",
+            ["PTS", "REB", "AST", "3PM", "PRA", "PR", "PA", "RA"],
+            key=k(prefix, "market"),
+        )
 
-    st.markdown("### Opponent context (auto + manual override)")
+        line = st.number_input("Prop line", value=18.5, step=0.5, key=k(prefix, "line"))
 
-    team_names = sorted(nba_name_to_id_map().keys())
-    id_to_name = nba_id_to_name_map()
+        pick_side = st.selectbox("Pick side", ["Over", "Under"], key=k(prefix, "pick_side"))
+        odds_in = st.text_input("Odds (optional, American)", value="-110", key=k(prefix, "odds"))
 
-    auto_today = st.checkbox("Auto-fill opponent/team from TODAY's game (if found)", value=True, key=K(prefix, "auto_today"))
+        st.markdown("#### Recent form")
+        games_recent = st.slider("Games used (recent)", 3, 25, 21, key=k(prefix, "games_recent"))
+        weight_recent_pct = st.slider("Weight: recent vs season (0=season, 100=recent)", 0, 100, 70, key=k(prefix, "weight_recent"))
 
-    # Optional manual overrides
-    player_team_override = st.selectbox(
-        "Player team (override, optional)",
-        ["(auto)"] + team_names,
-        key=K(prefix, "player_team_override"),
-    )
-    opp_team_override = st.selectbox(
-        "Opponent team (override, optional)",
-        ["(auto)"] + team_names,
-        key=K(prefix, "opp_team_override"),
-    )
+        st.markdown("#### Opponent context (fast)")
+        cA, cB = st.columns(2)
+        with cA:
+            defense_vs_pos = st.selectbox(
+                "Defense vs position",
+                ["Elite (Top 5)", "Good (6-10)", "Average (11-20)", "Weak (21-25)", "Bad (26-30)"],
+                index=2,
+                key=k(prefix, "dvp"),
+            )
+            pace = st.selectbox("Opponent pace", ["Fast", "Average", "Slow"], index=1, key=k(prefix, "pace"))
 
-    defense_vs_pos = st.selectbox(
-        "Defense vs position (manual)",
-        ["Elite (Top 5)", "Strong (6-10)", "Average (11-20)", "Weak (21-30)"],
-        index=2,
-        key=K(prefix, "def_vs_pos"),
-    )
-    overall_def = st.selectbox(
-        "Overall defense (manual)",
-        ["Elite (Top 5)", "Strong (6-10)", "Average (11-20)", "Weak (21-30)"],
-        index=2,
-        key=K(prefix, "overall_def"),
-    )
-    opp_pace_manual = st.selectbox(
-        "Opponent pace (manual)",
-        ["Fast", "Average", "Slow"],
-        index=1,
-        key=K(prefix, "opp_pace_manual"),
-    )
+        with cB:
+            overall_def = st.selectbox(
+                "Overall defense",
+                ["Elite (Top 5)", "Good (6-10)", "Average (11-20)", "Weak (21-25)", "Bad (26-30)"],
+                index=2,
+                key=k(prefix, "overall_def"),
+            )
+            b2b = st.selectbox("Back-to-back?", ["No", "Yes"], index=0, key=k(prefix, "b2b"))
 
-    b2b = st.selectbox("Back-to-back?", ["No", "Yes (player team)"], index=0, key=K(prefix, "b2b"))
-    blowout_risk = st.selectbox("Blowout risk", ["Low", "Medium", "High"], index=0, key=K(prefix, "blowout_risk"))
+        blowout = st.selectbox("Blowout risk", ["Low", "Medium", "High"], index=0, key=k(prefix, "blowout"))
 
-    st.markdown("### Minutes & usage intelligence")
-    expected_minutes = st.number_input("Expected minutes", min_value=0, max_value=48, value=34, step=1, key=K(prefix, "exp_min"))
-    minutes_vol = st.selectbox("Minutes volatility", ["Low", "Medium", "High"], index=0, key=K(prefix, "min_vol"))
-    usage_bump = st.selectbox("Usage bump (injuries / role)", ["None", "Some", "Major"], index=0, key=K(prefix, "usage_bump"))
+        st.markdown("#### Minutes & usage intelligence")
+        expected_minutes = st.number_input("Expected minutes", min_value=0, max_value=48, value=34, step=1, key=k(prefix, "mins"))
+        minutes_vol = st.selectbox("Minutes volatility", ["Low", "Medium", "High"], index=0, key=k(prefix, "mins_vol"))
+        usage_bump = st.selectbox("Usage bump (injuries / role)", ["None", "Small", "Medium", "Large"], index=0, key=k(prefix, "usage"))
+        teammates_out = st.slider("Key teammates OUT (count)", 0, 6, 0, key=k(prefix, "tm_out"))
 
-    st.markdown("### Injury / availability notes (practical)")
-    teammates_out = st.slider("Key teammates OUT (count)", 0, 5, 0, key=K(prefix, "tm_out"))
-    injury_notes = st.text_area("Notes (optional)", value="", height=80, key=K(prefix, "inj_notes"))
-    injury_minutes_adjust = st.slider(
-        "Minutes impact from injuries (manual)",
-        min_value=-8, max_value=8, value=0, step=1,
-        help="If you expect the player to play more/less because of injuries, adjust minutes here.",
-        key=K(prefix, "inj_min_adj"),
-    )
+        st.markdown("#### Injury report (notes)")
+        injury_notes = st.text_area(
+            "Paste injury notes here (optional). This won’t fetch automatically (keeps app fast).",
+            value="",
+            height=90,
+            key=k(prefix, "inj_notes"),
+        )
 
-    add_to_card = st.checkbox("Add result to Daily Card after analyze", value=False, key=K(prefix, "add_to_card"))
+        st.markdown("#### Output controls")
+        approved_only = st.checkbox("Show only Approved plays", value=False, key=k(prefix, "approved_only"))
+        add_to_card = st.checkbox("Add result to Daily Card after analyze", value=True, key=k(prefix, "add_to_card"))
 
-    st.divider()
+        submit = st.form_submit_button("Analyze NBA")
 
-    analyze = st.button("Analyze NBA", key=K(prefix, "analyze_btn"))
+    # Analyze only on submit (keeps it fast)
+    if submit:
+        # Parse odds
+        odds_val: Optional[int] = None
+        try:
+            odds_val = int(str(odds_in).strip())
+        except Exception:
+            odds_val = None
 
-    if analyze:
-        with st.spinner("Pulling NBA data..."):
-            pid = nba_get_player_id(player_name)
-            if pid is None:
-                st.error("Could not find that player name. Try full name spelling.")
-                st.stop()
+        ctx = NBAContext(
+            season=season.strip(),
+            market=market,
+            line=float(line),
+            pick_over=(pick_side == "Over"),
+            odds=odds_val,
+            games_recent=int(games_recent),
+            weight_recent=float(weight_recent_pct) / 100.0,
+            defense_vs_pos=defense_vs_pos,
+            overall_def=overall_def,
+            pace=pace,
+            b2b=b2b,
+            blowout=blowout,
+            expected_minutes=int(expected_minutes),
+            minutes_vol=minutes_vol,
+            usage_bump=usage_bump,
+            teammates_out=int(teammates_out),
+            injury_notes=injury_notes.strip(),
+            approved_only=approved_only,
+            add_to_card=add_to_card,
+        )
 
-            # Autofill team/opponent
-            player_team_id = nba_get_player_team_id(pid)
-            auto_player_team_name = id_to_name.get(player_team_id) if player_team_id else None
+        with st.spinner("Running analysis (safe timeout)…"):
+            out = analyze_nba_prop(player_name, ctx, season_type="Regular Season")
 
-            opp_team_id = None
-            auto_opp_team_name = None
-            if auto_today and player_team_id:
-                opp_team_id = nba_find_today_opponent_team_id(player_team_id)
-                auto_opp_team_name = id_to_name.get(opp_team_id) if opp_team_id else None
-
-            # Apply overrides if chosen
-            player_team_name = auto_player_team_name
-            if player_team_override != "(auto)":
-                player_team_name = player_team_override
-
-            opp_team_name = auto_opp_team_name
-            if opp_team_override != "(auto)":
-                opp_team_name = opp_team_override
-
-            # Auto ranks from NBA team stats if we can identify opponent
-            team_stats = nba_team_defense_pace(season)
-            opp_def_rank = None
-            opp_pace_rank = None
-            opp_def_rating = None
-            opp_pace = None
-            if not team_stats.empty and opp_team_name:
-                row = team_stats[team_stats["TEAM_NAME"] == opp_team_name]
-                if not row.empty:
-                    r = row.iloc[0]
-                    opp_def_rank = int(r["DEF_RANK"])
-                    opp_pace_rank = int(r["PACE_RANK"])
-                    opp_def_rating = float(r["DEF_RATING"])
-                    opp_pace = float(r["PACE"])
-
-            # Pull player logs
-            logs = nba_get_player_gamelog(pid, season)
-            if logs.empty:
-                st.error("No game logs found for that player/season yet.")
-                st.stop()
-
-            series = compute_market_series(logs, market)
-            if series.empty:
-                st.error("Could not compute that market from game logs.")
-                st.stop()
-
-            # Recent / season windows
-            recent = series.head(games_used)  # logs are newest-first
-            season_all = series
-
-            mu_recent = float(recent.mean())
-            sd_recent = float(recent.std(ddof=1)) if len(recent) > 1 else float(recent.std(ddof=0))
-            mu_season = float(season_all.mean())
-            sd_season = float(season_all.std(ddof=1)) if len(season_all) > 1 else float(season_all.std(ddof=0))
-
-            w = weight_recent / 100.0
-            mu_blend = (w * mu_recent) + ((1 - w) * mu_season)
-
-            # Base sigma blend (keep it honest)
-            sd_blend = (w * sd_recent) + ((1 - w) * sd_season)
-            sd_blend = max(sd_blend, 1.0)
-
-            # Adjustments
-            # Defense context: combine manual "vs position" and "overall"
-            mult_def = defense_category_multiplier(defense_vs_pos, side) * defense_category_multiplier(overall_def, side)
-
-            # Pace: prefer auto rank if available; else manual
-            pace_choice = opp_pace_manual
-            if opp_pace_rank is not None:
-                if opp_pace_rank <= 10:
-                    pace_choice = "Fast"
-                elif opp_pace_rank <= 20:
-                    pace_choice = "Average"
-                else:
-                    pace_choice = "Slow"
-            mult_pace = pace_multiplier(pace_choice)
-
-            mult_b2b = b2b_multiplier(b2b)
-            mult_blowout = blowout_minutes_multiplier(blowout_risk)
-            mult_usage = usage_bump_multiplier(usage_bump)
-
-            # Minutes logic (simple)
-            minutes_effect = (expected_minutes + injury_minutes_adjust) / 34.0
-            minutes_effect = clamp(minutes_effect, 0.75, 1.25)
-
-            # Teammates out nudges usage slightly (user controls via usage_bump too)
-            tm_out_effect = 1.0 + (0.01 * teammates_out)  # small
-            tm_out_effect = clamp(tm_out_effect, 1.0, 1.05)
-
-            mu_adj = mu_blend * mult_def * mult_pace * mult_b2b * mult_usage * minutes_effect * tm_out_effect
-
-            # Volatility adjustments (sigma up/down)
-            sd_adj = sd_blend * minutes_sigma_multiplier(minutes_vol)
-
-            # Probabilities
-            p_over = prob_over_line(mu_adj, sd_adj, line)
-            p_pick = p_over if side.lower() == "over" else (1.0 - p_over)
-
-            # Empirical hit rates
-            hr_recent = hit_rate(recent, line, side)
-            hr_season = hit_rate(season_all, line, side)
-
-            implied = american_to_implied_prob(odds) if odds is not None else None
-            edge = (p_pick - implied) if (implied is not None) else None
-
-            # Approval logic (conservative)
-            approved = True
-            reasons = []
-            if len(recent) < 8:
-                approved = False
-                reasons.append("Too few recent games in sample.")
-            if p_pick < 0.53:
-                approved = False
-                reasons.append("Model probability < 53%.")
-            if implied is not None and edge is not None and edge < 0.02:
-                approved = False
-                reasons.append("Edge vs implied < 2%.")
-            if blowout_risk.lower() == "high" and side.lower() == "over":
-                approved = False
-                reasons.append("High blowout risk hurts overs.")
-            if minutes_vol.lower() == "high" and side.lower() == "over":
-                reasons.append("High minutes volatility adds risk (watch).")
-
-            # Show results
-            st.markdown("## Results")
-            top = st.columns(2)
-            with top[0]:
-                st.write(f"**Player:** {player_name}  |  **Season:** {season}")
-                st.write(f"**Pick:** {side} {line} **{market}**")
-                st.write(f"**Auto team:** {auto_player_team_name or 'Unknown'}")
-                st.write(f"**Auto opponent today:** {auto_opp_team_name or 'Not found today'}")
-                if player_team_name:
-                    st.write(f"**Using player team:** {player_team_name}")
-                if opp_team_name:
-                    st.write(f"**Using opponent:** {opp_team_name}")
-
-            with top[1]:
-                if opp_def_rank is not None:
-                    st.write(f"**Opponent DEF Rank (auto):** {opp_def_rank}/30 ({categorize_rank(opp_def_rank)})")
-                    st.write(f"**Opponent DEF Rating:** {opp_def_rating:.2f}")
-                else:
-                    st.write("**Opponent DEF Rank (auto):** Not available")
-                if opp_pace_rank is not None:
-                    st.write(f"**Opponent Pace Rank (auto):** {opp_pace_rank}/30 ({pace_choice})")
-                    st.write(f"**Opponent Pace:** {opp_pace:.2f}")
-                else:
-                    st.write(f"**Opponent Pace (manual):** {pace_choice}")
-
-            st.divider()
-
-            st.markdown("### Probability & edge")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Model Prob (your side)", f"{p_pick*100:.1f}%")
-            c2.metric("Recent hit rate", f"{hr_recent*100:.1f}%")
-            c3.metric("Season hit rate", f"{hr_season*100:.1f}%")
-
-            if implied is not None:
-                st.write(f"**Implied probability from odds ({odds_str}):** {implied*100:.1f}%")
-            if edge is not None:
-                st.write(f"**Edge (Model − Implied):** {edge*100:.1f}%")
-
-            st.divider()
-
-            st.markdown("### Expected output (blended + adjusted)")
-            st.write(f"**Base mean (blend):** {mu_blend:.2f}")
-            st.write(f"**Adjusted mean (def/pace/min/usage):** {mu_adj:.2f}")
-            st.write(f"**Adjusted sigma (volatility):** {sd_adj:.2f}")
-
-            st.divider()
-
-            st.markdown("### Filters / context used")
-            st.write(f"- Defense vs position (manual): **{defense_vs_pos}**")
-            st.write(f"- Overall defense (manual): **{overall_def}**")
-            st.write(f"- Pace used: **{pace_choice}**")
-            st.write(f"- Back-to-back: **{b2b}**")
-            st.write(f"- Blowout risk: **{blowout_risk}**")
-            st.write(f"- Expected minutes: **{expected_minutes}** (inj adj {injury_minutes_adjust:+d})")
-            st.write(f"- Minutes volatility: **{minutes_vol}**")
-            st.write(f"- Usage bump: **{usage_bump}**")
-            st.write(f"- Teammates out: **{teammates_out}**")
-            if injury_notes.strip():
-                st.write(f"- Injury notes: {injury_notes}")
-
-            st.divider()
-
-            st.markdown("### Approved?")
-            if approved:
-                st.success("✅ Approved play (based on your filters)")
+        if not out.get("ok", False):
+            st.error("Could not analyze.")
+            for e in out.get("errors", []):
+                st.write(f"- {e}")
+        else:
+            approved = out["approved"]
+            if approved_only and not approved:
+                st.info("This play is not Approved, and you enabled Approved-only filter.")
             else:
-                st.warning("⚠️ Not approved (based on your filters)")
-                if reasons:
-                    for r in reasons:
+                # Display core decision block
+                st.markdown("### Result")
+                badge = "✅ Approved" if approved else "⚠️ Not Approved"
+                st.subheader(f"{player_name} — {market} {pick_side} {line:.1f}  •  {badge}")
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Adj mean", f"{out['adj_mean']:.2f}")
+                c2.metric("Std dev", f"{out['sd']:.2f}")
+                c3.metric("Win % (model)", f"{out['p_pick']*100:.1f}%")
+
+                if out["implied"] is not None:
+                    st.caption(f"Implied win % from odds: {out['implied']*100:.1f}%")
+                if out["edge"] is not None:
+                    st.caption(f"Edge vs implied: {out['edge']*100:.1f}%")
+
+                st.markdown("**Recent vs Season**")
+                st.write(
+                    f"- Last {out['recent_n']} avg: **{out['recent_mean']:.2f}**\n"
+                    f"- Season avg: **{out['season_mean']:.2f}**\n"
+                    f"- Blended base: **{out['base_mean']:.2f}** → Context-adjusted: **{out['adj_mean']:.2f}**"
+                )
+
+                st.markdown("**Last 10 (most recent first)**")
+                st.write(", ".join([str(int(x)) if float(x).is_integer() else f"{x:.1f}" for x in out["last_10"]]))
+
+                if out["reasons"]:
+                    st.markdown("**Notes / Flags**")
+                    for r in out["reasons"]:
                         st.write(f"- {r}")
 
-            if show_only_approved and not approved:
-                st.info("You have 'Show only Approved plays' enabled — this play is not approved.")
-                st.stop()
+                if ctx.injury_notes:
+                    st.markdown("**Injury notes you pasted**")
+                    st.write(ctx.injury_notes)
 
-            if add_to_card:
-                add_to_daily_card({
-                    "League": "NBA",
-                    "Player": player_name,
-                    "Market": market,
-                    "Side": side,
-                    "Line": line,
-                    "Odds": odds_str,
-                    "Prob": round(p_pick * 100, 1),
-                    "RecentHR": round(hr_recent * 100, 1),
-                    "SeasonHR": round(hr_season * 100, 1),
-                    "Opponent": opp_team_name or auto_opp_team_name or "",
-                    "Notes": injury_notes[:140] if injury_notes else "",
-                    "Approved": approved
-                })
-                st.success("Added to Daily Card ✅")
+                # Add to Daily Card
+                if ctx.add_to_card:
+                    st.session_state.daily_card.append(
+                        {
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "sport": "NBA",
+                            "player": player_name,
+                            "market": market,
+                            "side": pick_side,
+                            "line": float(line),
+                            "odds": odds_val,
+                            "win_pct": float(out["p_pick"]) * 100.0,
+                            "adj_mean": float(out["adj_mean"]),
+                            "sd": float(out["sd"]),
+                            "approved": bool(out["approved"]),
+                        }
+                    )
+                    st.success("Added to Daily Card ✅")
 
-# =========================================================
-# NFL TAB (lightweight but powerful, since auto schedule/roster varies)
-# =========================================================
+
+# ----------------------------
+# NFL TAB (skeleton + fast, extendable)
+# ----------------------------
 with tabs[1]:
+    st.subheader("NFL Prop Analyzer (fast + manual opponent context)")
+    st.info("NFL auto data pulls can be added later. For speed/reliability, this tab is manual-first (still very useful).")
+
     prefix = "nfl"
-    st.subheader("NFL Prop Analyzer (Fast + Manual — built to avoid broken data feeds)")
+    with st.form(key=k(prefix, "form")):
+        player = st.text_input("Player", value="", key=k(prefix, "player"))
+        market = st.selectbox("Market", ["REC YDS", "RUSH YDS", "PASS YDS", "RECEPTIONS", "RUSH+REC YDS", "TD"], key=k(prefix, "market"))
+        line = st.number_input("Prop line", value=0.0, step=0.5, key=k(prefix, "line"))
+        pick = st.selectbox("Pick side", ["Over", "Under"], key=k(prefix, "pick"))
+        odds = st.text_input("Odds (optional, American)", value="", key=k(prefix, "odds"))
 
-    st.caption("NFL auto rosters/injury feeds are messy without paid providers. This is the best reliable setup: you enter line/averages and context, and it produces probabilities + approval.")
+        st.markdown("#### Opponent context (manual, fast)")
+        redzone_def = st.selectbox("Opponent red zone defense", ["Elite", "Good", "Average", "Bad"], index=2, key=k(prefix, "rz"))
+        matchup = st.selectbox("Matchup strength vs role", ["Great", "Good", "Average", "Tough"], index=2, key=k(prefix, "matchup"))
+        game_script = st.selectbox("Game script", ["Likely leading", "Neutral", "Likely trailing"], index=1, key=k(prefix, "script"))
+        injury_notes = st.text_area("Injury notes (paste)", value="", height=80, key=k(prefix, "inj"))
 
-    col1, col2 = st.columns(2)
-    with col1:
-        nfl_player = st.text_input("Player", value="(type player)", key=K(prefix, "player"))
-        nfl_market = st.selectbox("Market", ["Pass Yds", "Rush Yds", "Rec Yds", "Receptions", "Anytime TD (heuristic)"], key=K(prefix, "market"))
-        nfl_side = st.selectbox("Pick side", ["Over", "Under"], key=K(prefix, "side"))
-        nfl_line = st.number_input("Line", value=49.5, step=0.5, key=K(prefix, "line"))
+        submit_nfl = st.form_submit_button("Analyze NFL")
 
-    with col2:
-        nfl_odds_str = st.text_input("Odds (optional, American)", value="-110", key=K(prefix, "odds_str"))
-        nfl_odds = safe_float(nfl_odds_str, default=None)
-        nfl_recent_n = st.slider("Games used (recent)", 3, 10, 6, key=K(prefix, "recent_n"))
-        nfl_weight_recent = st.slider("Weight: recent vs season", 0, 100, 60, key=K(prefix, "w_recent"))
+    if submit_nfl:
+        # lightweight heuristic output (no external calls)
+        try:
+            o = int(odds) if str(odds).strip() else None
+        except Exception:
+            o = None
 
-    st.markdown("### Inputs (paste your numbers)")
-    c3, c4, c5 = st.columns(3)
-    with c3:
-        season_avg = st.number_input("Season avg", value=55.0, step=0.5, key=K(prefix, "season_avg"))
-        season_sd = st.number_input("Season stdev (rough)", value=18.0, step=0.5, key=K(prefix, "season_sd"))
-    with c4:
-        recent_avg = st.number_input(f"Last {nfl_recent_n} avg", value=58.0, step=0.5, key=K(prefix, "recent_avg"))
-        recent_sd = st.number_input(f"Last {nfl_recent_n} stdev (rough)", value=16.0, step=0.5, key=K(prefix, "recent_sd"))
-    with c5:
-        opp_def = st.selectbox("Opponent defense strength vs this market", ["Elite (Top 5)", "Strong (6-10)", "Average (11-20)", "Weak (21-30)"], index=2, key=K(prefix, "opp_def"))
-        game_script = st.selectbox("Game script", ["Neutral", "Likely lead (more run)", "Likely trail (more pass)"], key=K(prefix, "script"))
-        injury_role = st.selectbox("Role/Injury impact", ["None", "Some boost", "Major boost", "Some downgrade"], key=K(prefix, "inj_role"))
+        base = 0.52
+        # quick heuristics
+        adj = 0.0
+        adj += {"Elite": -0.05, "Good": -0.02, "Average": 0.0, "Bad": 0.03}.get(redzone_def, 0.0)
+        adj += {"Great": 0.05, "Good": 0.02, "Average": 0.0, "Tough": -0.03}.get(matchup, 0.0)
+        adj += {"Likely leading": 0.02, "Neutral": 0.0, "Likely trailing": -0.02}.get(game_script, 0.0)
 
-    st.markdown("### Optional notes")
-    nfl_notes = st.text_area("Notes", value="", height=80, key=K(prefix, "notes"))
+        p_over = float(np.clip(base + adj, 0.05, 0.95))
+        p_pick = p_over if pick == "Over" else (1 - p_over)
 
-    if st.button("Analyze NFL", key=K(prefix, "analyze")):
-        w = nfl_weight_recent / 100.0
-        mu = (w * recent_avg) + ((1 - w) * season_avg)
-        sd = (w * recent_sd) + ((1 - w) * season_sd)
-        sd = max(sd, 1.0)
-
-        # Adjustments
-        mult_def = defense_category_multiplier(opp_def, nfl_side)
-        mult_script = 1.0
-        if "lead" in game_script.lower() and "pass" in nfl_market.lower():
-            mult_script = 0.96
-        if "trail" in game_script.lower() and "pass" in nfl_market.lower():
-            mult_script = 1.04
-        if "lead" in game_script.lower() and ("rush" in nfl_market.lower() or "td" in nfl_market.lower()):
-            mult_script = 1.03
-
-        mult_inj = 1.0
-        if "some boost" in injury_role.lower():
-            mult_inj = 1.03
-        elif "major boost" in injury_role.lower():
-            mult_inj = 1.07
-        elif "downgrade" in injury_role.lower():
-            mult_inj = 0.95
-
-        mu_adj = mu * mult_def * mult_script * mult_inj
-
-        p_over = prob_over_line(mu_adj, sd, nfl_line)
-        p_pick = p_over if nfl_side.lower() == "over" else (1 - p_over)
-
-        implied = american_to_implied_prob(nfl_odds) if nfl_odds is not None else None
+        implied = american_to_implied_prob(o) if o is not None else None
         edge = (p_pick - implied) if implied is not None else None
 
-        approved = True
-        reasons = []
-        if p_pick < 0.53:
-            approved = False
-            reasons.append("Model probability < 53%")
-        if edge is not None and edge < 0.02:
-            approved = False
-            reasons.append("Edge vs implied < 2%")
-        if sd > 28 and nfl_side.lower() == "over":
-            reasons.append("High volatility risk (watch)")
-
-        st.markdown("## Results")
-        st.write(f"**{nfl_player} — {nfl_side} {nfl_line} {nfl_market}**")
-        st.write(f"**Adj mean:** {mu_adj:.2f}  |  **Sigma:** {sd:.2f}")
-        st.write(f"**Model prob:** {p_pick*100:.1f}%")
+        st.markdown("### Result")
+        st.subheader(f"{player} — {market} {pick} {line:.1f}")
+        st.metric("Win % (heuristic)", f"{p_pick*100:.1f}%")
         if implied is not None:
-            st.write(f"**Implied prob ({nfl_odds_str}):** {implied*100:.1f}%")
+            st.caption(f"Implied win % from odds: {implied*100:.1f}%")
         if edge is not None:
-            st.write(f"**Edge:** {edge*100:.1f}%")
+            st.caption(f"Edge vs implied: {edge*100:.1f}%")
+        if injury_notes.strip():
+            st.markdown("**Injury notes**")
+            st.write(injury_notes.strip())
 
-        if approved:
-            st.success("✅ Approved")
-        else:
-            st.warning("⚠️ Not approved")
-            for r in reasons:
-                st.write(f"- {r}")
 
-        if nfl_notes.strip():
-            st.write(f"**Notes:** {nfl_notes}")
-
-        if st.checkbox("Add this to Daily Card", value=False, key=K(prefix, "add_card_after")):
-            add_to_daily_card({
-                "League": "NFL",
-                "Player": nfl_player,
-                "Market": nfl_market,
-                "Side": nfl_side,
-                "Line": nfl_line,
-                "Odds": nfl_odds_str,
-                "Prob": round(p_pick * 100, 1),
-                "RecentHR": "",
-                "SeasonHR": "",
-                "Opponent": "",
-                "Notes": nfl_notes[:140] if nfl_notes else "",
-                "Approved": approved
-            })
-            st.success("Added to Daily Card ✅")
-
-# =========================================================
-# LIVE (2H) TAB
-# =========================================================
+# ----------------------------
+# Live (2H) TAB (fast)
+# ----------------------------
 with tabs[2]:
+    st.subheader("Live (2H) Quick Check")
+    st.caption("Fast calculator for halftime situations. Paste current stat + line, get quick probability estimate.")
+
     prefix = "live"
-    st.subheader("Live (2H) — Quick Decision Helper")
+    with st.form(key=k(prefix, "form")):
+        market = st.selectbox("Market", ["PTS", "REB", "AST", "PRA"], key=k(prefix, "market"))
+        current = st.number_input("Current stat (right now)", value=0.0, step=1.0, key=k(prefix, "current"))
+        line = st.number_input("Full game line", value=0.0, step=0.5, key=k(prefix, "line"))
+        minutes_left = st.number_input("Estimated minutes left", value=24.0, step=1.0, key=k(prefix, "mins_left"))
+        pick = st.selectbox("Pick side", ["Over", "Under"], key=k(prefix, "pick"))
+        odds = st.text_input("Odds (optional)", value="", key=k(prefix, "odds"))
+        vol = st.selectbox("Volatility", ["Low", "Medium", "High"], index=1, key=k(prefix, "vol"))
+        submit_live = st.form_submit_button("Estimate")
 
-    st.caption("This doesn’t scrape live scores. You paste halftime stats/score and it tells you what’s needed to hit props.")
+    if submit_live:
+        try:
+            o = int(odds) if str(odds).strip() else None
+        except Exception:
+            o = None
 
-    col1, col2 = st.columns(2)
-    with col1:
-        live_player = st.text_input("Player", value="(player)", key=K(prefix, "player"))
-        live_market = st.selectbox("Market", ["PTS", "REB", "AST", "3PM", "PRA", "PR", "PA"], key=K(prefix, "market"))
-        live_line = st.number_input("Full game line", value=24.5, step=0.5, key=K(prefix, "line"))
-        live_side = st.selectbox("Pick side", ["Over", "Under"], key=K(prefix, "side"))
-    with col2:
-        halftime_value = st.number_input("Player stat at halftime", value=12.0, step=0.5, key=K(prefix, "ht_val"))
-        minutes_played = st.number_input("Minutes played at halftime", value=17.0, step=1.0, key=K(prefix, "ht_min"))
-        exp_total_minutes = st.number_input("Expected total minutes", value=34.0, step=1.0, key=K(prefix, "exp_total_min"))
-        live_odds = st.text_input("Live odds (optional)", value="", key=K(prefix, "odds"))
+        # crude pace projection: assume remaining production proportional to minutes left
+        # add volatility SD based on remaining time
+        remaining = max(line - current, 0.0)
+        # mean remaining = (current / minutes played) * minutes_left; approximate minutes played = 48 - minutes_left
+        mins_played = max(48.0 - float(minutes_left), 1.0)
+        rate = float(current) / mins_played
+        mean_final = float(current) + rate * float(minutes_left)
 
-    if st.button("Compute 2H needs", key=K(prefix, "compute")):
-        remaining = max(0.0, live_line - halftime_value)
-        if live_side.lower() == "under":
-            # Under: how much room left
-            remaining = max(0.0, live_line - halftime_value)
+        base_sd = {"Low": 6.0, "Medium": 9.0, "High": 12.0}.get(vol, 9.0)
+        # scale sd by remaining time
+        sd = base_sd * math.sqrt(float(minutes_left) / 24.0)
 
-        minutes_left = max(0.0, exp_total_minutes - minutes_played)
+        p_over = prob_over(float(line), mean_final, sd)
+        p_pick = p_over if pick == "Over" else (1 - p_over)
 
-        st.markdown("## 2H Snapshot")
-        if live_side.lower() == "over":
-            st.write(f"Needs **{remaining:.1f}** more in 2H to clear **{live_line}**.")
-        else:
-            st.write(f"Has **{(live_line - halftime_value):.1f}** 'room' left to stay under **{live_line}**.")
+        implied = american_to_implied_prob(o) if o is not None else None
+        edge = (p_pick - implied) if implied is not None else None
 
-        if minutes_left > 0:
-            needed_per_min = remaining / minutes_left if live_side.lower() == "over" else 0.0
-            st.write(f"Estimated minutes left: **{minutes_left:.1f}**")
-            if live_side.lower() == "over":
-                st.write(f"Needs about **{needed_per_min:.3f} per minute** for the rest of the game.")
-        st.info("Tip: if foul trouble / blowout risk changes minutes, adjust expected total minutes and rerun.")
+        st.markdown("### Live estimate")
+        st.write(f"Projected final (rough): **{mean_final:.1f}**  |  SD: **{sd:.1f}**")
+        st.metric("Win %", f"{p_pick*100:.1f}%")
+        if implied is not None:
+            st.caption(f"Implied win %: {implied*100:.1f}%")
+        if edge is not None:
+            st.caption(f"Edge vs implied: {edge*100:.1f}%")
 
-# =========================================================
-# DAILY CARD TAB
-# =========================================================
+
+# ----------------------------
+# Daily Card TAB
+# ----------------------------
 with tabs[3]:
     st.subheader("Daily Card")
     if not st.session_state.daily_card:
-        st.info("No picks saved yet. Use 'Add to Daily Card' in NBA/NFL tabs.")
+        st.info("No plays saved yet. Analyze a play and check 'Add result to Daily Card'.")
     else:
         df = pd.DataFrame(st.session_state.daily_card)
         st.dataframe(df, use_container_width=True)
 
-        st.markdown("### Quick view (Approved first)")
-        try:
-            df2 = df.copy()
-            df2["ApprovedSort"] = df2["Approved"].astype(int)
-            df2 = df2.sort_values(["ApprovedSort", "Prob"], ascending=False).drop(columns=["ApprovedSort"])
-            st.dataframe(df2, use_container_width=True)
-        except Exception:
-            pass
-
-        if st.button("Clear Daily Card", key="clear_daily_card"):
-            st.session_state.daily_card = []
-            st.success("Cleared ✅")
-
-# =========================================================
-# SETTINGS TAB
-# =========================================================
-with tabs[4]:
-    st.subheader("Settings / Notes")
-    st.write("✅ This app is designed to run reliably on Streamlit Cloud (no SciPy, no fragile scraping).")
-    st.write("If NBA auto opponent doesn’t find a game, it’s usually because:")
-    st.write("- no NBA games today, or")
-    st.write("- the game date is in a different timezone window (late night).")
-    st.write("")
-    st.write("If you want, I can add a manual 'date override' for the NBA scoreboard so you can set the date in-app.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Clear Daily Card", key="clear_daily"):
+                st.session_state.daily_card = []
+                st.success("Cleared.")
+        with c2:
+            st.caption("Tip: keep it to 2–3 highest-confidence plays/day.")
