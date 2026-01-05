@@ -6,6 +6,8 @@ import streamlit as st
 from nba_api.stats.endpoints import playergamelog
 from nba_api.stats.static import players as nba_players
 import nfl_data_py as nfl
+st.warning("DEBUG: App reloaded")
+st.write("If you see this, this file is running")
 # -----------------------------
 # Defense vs Position modifiers
 # -----------------------------
