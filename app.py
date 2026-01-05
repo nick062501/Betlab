@@ -291,67 +291,78 @@ with tab_nba:
 
     # --- Auto-Fill button (outside form, so it runs instantly) ---
     colA, colB = st.columns([1, 3])
-    with colA:
-        auto_fill_clicked = st.button("⚡ Auto-Fill (Today)", key=k("nba", "autofill_btn"))
-    with colB:
-        st.caption("Auto-fills: team, opponent, opponent DEF tier, opponent pace tier → and writes them into the dropdown filters (still overrideable).")
+with colA:
+    auto_fill_clicked = st.button("⚡ Auto-Fill (Today)", key=k("nba", "autofill_btn"))
+with colB:
+    st.caption("Auto-fills opponent + sets the dropdowns (overall defense + pace + opponent/team fields). Still overrideable.")
 
-    if auto_fill_clicked:
-        timeout = float(st.session_state.get(k("settings", "api_timeout"), 10))
-        with st.spinner("Auto-filling team + opponent + defense rank + pace..."):
-            player_name_for_fill = st.session_state.get(k("nba", "player_name"), "").strip()
-            season_for_fill = st.session_state.get(k("nba", "season"), "2025-26").strip()
+if auto_fill_clicked:
+    timeout = float(st.session_state.get(k("settings", "api_timeout"), 10))
 
-            pid = find_player_id(player_name_for_fill)
-            if pid is None:
-                st.error("Player not found for auto-fill. Check spelling.")
+    # IMPORTANT: Use whatever is currently in the text box (if it exists),
+    # otherwise fall back to what’s in session_state.
+    player_name_for_fill = st.session_state.get(k("nba", "player_name"), "").strip()
+    season_for_fill = st.session_state.get(k("nba", "season"), "2025-26").strip()
+
+    with st.spinner("Auto-filling filters..."):
+        pid = find_player_id(player_name_for_fill)
+        if pid is None:
+            st.error("Player not found for auto-fill. Use full name (e.g. 'Stephen Curry').")
+        else:
+            ok, glog, err = safe_call(nba_gamelog_df, timeout, pid, season_for_fill)
+            if (not ok) or glog is None or glog.empty:
+                st.error(f"Could not pull player logs. {err}")
             else:
-                ok, glog, err = safe_call(nba_gamelog_df, timeout, pid, season_for_fill)
-                if not ok or glog is None or glog.empty:
-                    st.error(f"Could not pull player logs for team inference. {err}")
-                else:
-                    if "GAME_DATE" in glog.columns:
-                        glog = glog.sort_values("GAME_DATE", ascending=False)
+                if "GAME_DATE" in glog.columns:
+                    glog = glog.sort_values("GAME_DATE", ascending=False)
 
-                    team_id = infer_team_id_from_gamelog(glog)
-                    team_name = team_id_to_name(team_id)
+                team_id = infer_team_id_from_gamelog(glog)
+                team_name = team_id_to_name(team_id)
 
-                    opp_id = find_today_opponent_team_id(team_id) if team_id else None
-                    opp_name = team_id_to_name(opp_id) if opp_id else None
+                opp_id = find_today_opponent_team_id(team_id) if team_id else None
+                opp_name = team_id_to_name(opp_id) if opp_id else None
 
-                    # Save basic auto info
-                    st.session_state[k("nba", "autofill_team_name")] = team_name
-                    st.session_state[k("nba", "autofill_opp_name")] = opp_name
+                # Save autofill info (for display)
+                st.session_state[k("nba", "autofill_team_name")] = team_name
+                st.session_state[k("nba", "autofill_opp_name")] = opp_name
 
-                    # Pull defense/pace ranks for opponent and WRITE INTO DROPDOWNS
-                    if opp_name:
-                        ok2, tctx, err2 = safe_call(nba_team_context_df, timeout, season_for_fill)
-                        if ok2 and tctx is not None and not tctx.empty:
-                            row = tctx[tctx["TEAM_NAME"] == opp_name]
-                            if not row.empty:
-                                def_rank = int(row.iloc[0]["DEF_RANK"])
-                                pace_rank = int(row.iloc[0]["PACE_RANK"])
+                # ✅ SET THE ACTUAL DROPDOWNS so the UI shows it:
+                # Set team override dropdown to team name if found
+                if team_name and (team_name in team_names):
+                    st.session_state[k("nba", "team_override")] = team_name
 
-                                def_tier = tier_from_rank(def_rank)
-                                pace_tier = pace_from_rank(pace_rank)
+                # Set opponent override dropdown to opponent name if found
+                if opp_name and (opp_name in team_names):
+                    st.session_state[k("nba", "opp_override")] = opp_name
 
-                                # Store ranks
-                                st.session_state[k("nba", "autofill_def_rank")] = def_rank
-                                st.session_state[k("nba", "autofill_pace_rank")] = pace_rank
+                # Pull opponent rank/tier and write into defense/pace widgets
+                if opp_name:
+                    ok2, tctx, err2 = safe_call(nba_team_context_df, timeout, season_for_fill)
+                    if ok2 and tctx is not None and (not tctx.empty):
+                        row = tctx[tctx["TEAM_NAME"] == opp_name]
+                        if not row.empty:
+                            def_rank = int(row.iloc[0]["DEF_RANK"])
+                            pace_rank = int(row.iloc[0]["PACE_RANK"])
+                            def_tier = tier_from_rank(def_rank)
+                            pace_tier = pace_from_rank(pace_rank)
 
-                                # ✅ THIS IS THE IMPORTANT PART:
-                                # Write the auto values INTO the widget state so dropdowns change automatically
-                                if def_tier:
-                                    st.session_state[k("nba", "overall_def")] = def_tier
-                                    # optional: set dvp to same tier as a placeholder (true dvp needs more data)
-                                    st.session_state[k("nba", "dvp")] = def_tier
+                            st.session_state[k("nba", "autofill_def_rank")] = def_rank
+                            st.session_state[k("nba", "autofill_pace_rank")] = pace_rank
 
-                                if pace_tier:
-                                    st.session_state[k("nba", "pace")] = pace_tier
+                            # ✅ These are the REAL widget keys in your form:
+                            # overall_def selectbox key = k("nba","overall_def")
+                            # dvp selectbox key = k("nba","dvp")
+                            # pace selectbox key = k("nba","pace")
+                            if def_tier in DEF_TIER:
+                                st.session_state[k("nba", "overall_def")] = def_tier
+                                st.session_state[k("nba", "dvp")] = def_tier  # placeholder = same tier
+                            if pace_tier in ["Fast", "Average", "Slow"]:
+                                st.session_state[k("nba", "pace")] = pace_tier
+                    else:
+                        st.warning(f"Could not pull defense/pace ranks right now. {err2}")
 
-                        else:
-                            st.warning(f"Opponent ranks not available right now. {err2}")
-
+    # ✅ Force a rerun so widgets repaint with the new state
+    st.rerun()
                     st.success(f"Auto-Fill ✅ Team: {team_name or 'Unknown'} | Opp: {opp_name or 'Not found today'}")
 
     # Show current autofill state
