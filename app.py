@@ -43,17 +43,40 @@ tab1, tab2 = st.tabs(["🏀 NBA", "🏈 NFL"])
 with tab1:
     st.subheader("NBA Prop Analyzer")
 
-    player = st.text_input("Player", "Stephen Curry")
-    season = st.text_input("Season", "2025-26")
-    market = st.selectbox("Market", ["PTS", "REB", "AST", "PRA"])
-line = st.number_input("Line", 18.5, step=0.5)
-side = st.selectbox("Pick", ["Over", "Under"])
+player = st.text_input("Player", "Stephen Curry")
+season = st.selectbox("Season", ["2025-26"])
+market = st.selectbox("Market", ["PTS", "REB", "AST", "PTS+REB"])
+line = st.number_input("Line", value=18.5)
+pick = st.selectbox("Pick", ["Over", "Under"])
 
-defense_tier = st.selectbox(
-    "Opponent Defense vs Position",
+# Defense filters (this is what was missing visually)
+st.divider()
+st.subheader("Advanced Filters")
+
+def_rank = st.selectbox(
+    "Opponent Defense Rank (Overall)",
+    ["Top 5", "Top 10", "Average", "Bottom 10", "Bottom 5"]
+)
+
+pos_def = st.selectbox(
+    "Defense vs Player Position",
     ["Elite", "Above Avg", "Average", "Below Avg", "Poor"]
 )
-    if st.button("Analyze NBA"):
+
+pace = st.selectbox(
+    "Opponent Pace",
+    ["Fast", "Average", "Slow"]
+)
+
+minutes_risk = st.selectbox(
+    "Minutes Volatility",
+    ["Low", "Medium", "High"]
+)
+
+st.divider()
+
+if st.button("Analyze NBA"):
+    st.success("Analysis running...")
         pid = nba_players.find_players_by_full_name(player)
         if not pid:
             st.error("Player not found")
