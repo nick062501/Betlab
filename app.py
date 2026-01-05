@@ -362,7 +362,7 @@ if auto_fill_clicked:
 
     # ✅ Force a rerun so widgets repaint with the new state
     st.rerun()
-                    st.success(f"Auto-Fill ✅ Team: {team_name or 'Unknown'} | Opp: {opp_name or 'Not found today'}")
+    st.success(f"Auto-Fill ✅ Team: {team_name or 'Unknown'} | Opp: {opp_name or 'Not found today'}")
 
     # Show current autofill state
     auto_team = st.session_state.get(k("nba", "autofill_team_name"))
