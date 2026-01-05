@@ -1,4 +1,5 @@
-streamlit==1.37.0
-pandas==2.2.2
-nba_api==1.6.1
-requests==2.32.3
+streamlit
+pandas
+numpy
+nba_api
+requests
