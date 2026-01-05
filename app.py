@@ -492,7 +492,7 @@ with tab_nba:
 
                         st.markdown("### Last 10 (most recent first)")
                         last10 = s.iloc[:10].tolist()
-                        st.write(", ".join([str(int(x)) if float(x).is_integer() else f\"{x:.1f}\" for x in last10]))
+                        st.write(", ".join([str(int(x)) if float(x).is_integer() else f\{x:.1f}\" for x in last10]))
 
                         if reasons:
                             st.markdown("### Flags")
