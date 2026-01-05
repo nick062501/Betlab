@@ -1,536 +1,512 @@
 import math
-from datetime import datetime, date
-from typing import Optional, Tuple, Dict, Any
+import datetime as dt
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-# ----------------------------
-# NBA API imports (guarded)
-# ----------------------------
-try:
-    from nba_api.stats.endpoints import leaguedashteamstats, playergamelog, scoreboardv2
-    from nba_api.stats.static import players as nba_players
-    from nba_api.stats.static import teams as nba_teams
-    NBA_API_AVAILABLE = True
-except Exception:
-    NBA_API_AVAILABLE = False
+from nba_api.stats.endpoints import (
+    scoreboardv2,
+    commonallplayers,
+    commonplayerinfo,
+    playergamelog,
+    leaguedashteamstats,
+)
 
-# ----------------------------
-# Streamlit config
-# ----------------------------
-st.set_page_config(page_title="BetLab — NBA Only", page_icon="🏀", layout="centered")
-st.title("🏀 BetLab — NBA Only (Fast + Working AutoFill)")
-st.caption("AutoFill updates opponent + DEF tier + pace tier directly into your filters. You can still override everything.")
+# -----------------------------
+# Helpers (NO SciPy)
+# -----------------------------
+def normal_cdf(x: float, mu: float, sigma: float) -> float:
+    """CDF of Normal(mu, sigma) using erf (no scipy)."""
+    if sigma <= 1e-9:
+        return 1.0 if x >= mu else 0.0
+    z = (x - mu) / (sigma * math.sqrt(2.0))
+    return 0.5 * (1.0 + math.erf(z))
 
-# ----------------------------
-# Keys / math helpers
-# ----------------------------
-def k(prefix: str, name: str) -> str:
-    return f"{prefix}__{name}"
+def american_to_implied_prob(odds: int) -> float:
+    """Convert American odds to implied probability."""
+    if odds == 0:
+        return 0.0
+    if odds < 0:
+        return (-odds) / ((-odds) + 100.0)
+    return 100.0 / (odds + 100.0)
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-def normal_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+# -----------------------------
+# Config
+# -----------------------------
+st.set_page_config(page_title="BetLab — NBA Only (Fast)", layout="centered")
 
-def prob_over(line: float, mean: float, sd: float) -> float:
-    sd = max(sd, 1e-6)
-    z = (line - mean) / sd
-    return 1.0 - normal_cdf(z)
+st.title("🏀 BetLab — NBA Only (Fast)")
+st.caption("NBA-only build for speed + stability. Auto-Fill syncs opponent + DEF tier + Pace tier. Everything remains overrideable.")
 
-def american_to_implied_prob(odds: Optional[int]) -> Optional[float]:
-    if odds is None or odds == 0:
-        return None
-    if odds > 0:
-        return 100.0 / (odds + 100.0)
-    return (-odds) / ((-odds) + 100.0)
-
-def safe_call(fn, timeout_sec: float, *args, **kwargs):
-    """Hard-timeout wrapper so Streamlit never hangs forever."""
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn, *args, **kwargs)
-        try:
-            res = fut.result(timeout=timeout_sec)
-            return True, res, ""
-        except FuturesTimeoutError:
-            return False, None, f"Timed out after {timeout_sec:.0f}s"
-        except Exception as e:
-            return False, None, f"{type(e).__name__}: {e}"
-
-# ----------------------------
-# Cached lookups
-# ----------------------------
+# -----------------------------
+# Caching NBA API calls
+# -----------------------------
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def nba_players_df() -> pd.DataFrame:
-    if not NBA_API_AVAILABLE:
-        return pd.DataFrame()
-    return pd.DataFrame(nba_players.get_players())  # includes id, full_name
+def get_all_players_df() -> pd.DataFrame:
+    df = commonallplayers.CommonAllPlayers(is_only_current_season=1).get_data_frames()[0]
+    # Columns: PERSON_ID, DISPLAY_FIRST_LAST, ...
+    df["NAME_LOWER"] = df["DISPLAY_FIRST_LAST"].str.lower()
+    return df
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def nba_teams_df() -> pd.DataFrame:
-    if not NBA_API_AVAILABLE:
-        return pd.DataFrame()
-    return pd.DataFrame(nba_teams.get_teams())  # includes id, full_name, abbreviation
-
-@st.cache_data(ttl=60 * 60, show_spinner=False)
-def nba_team_context_df(season: str) -> pd.DataFrame:
-    """
-    Team DEF_RATING rank (lower is better) + PACE rank (higher is faster).
-    """
-    df = leaguedashteamstats.LeagueDashTeamStats(
-        season=season,
-        season_type_all_star="Regular Season",
-        per_mode_detailed="PerGame",
-        measure_type_detailed_defense="Base",
-    ).get_data_frames()[0]
-    if "DEF_RATING" not in df.columns or "PACE" not in df.columns:
-        return pd.DataFrame()
-    out = df[["TEAM_ID", "TEAM_NAME", "DEF_RATING", "PACE"]].copy()
-    out["DEF_RANK"] = out["DEF_RATING"].rank(method="min", ascending=True).astype(int)   # 1 best defense
-    out["PACE_RANK"] = out["PACE"].rank(method="min", ascending=False).astype(int)      # 1 fastest
-    return out
-
-@st.cache_data(ttl=60 * 20, show_spinner=False)
-def nba_gamelog_df(player_id: int, season: str) -> pd.DataFrame:
-    return playergamelog.PlayerGameLog(
-        player_id=player_id,
-        season=season,
-        season_type_all_star="Regular Season",
-    ).get_data_frames()[0]
+@st.cache_data(ttl=60 * 15, show_spinner=False)
+def get_player_info(player_id: int) -> dict:
+    df = commonplayerinfo.CommonPlayerInfo(player_id=player_id).get_data_frames()[0]
+    if df.empty:
+        return {}
+    row = df.iloc[0].to_dict()
+    return row  # includes TEAM_ID, TEAM_NAME, TEAM_ABBREVIATION, etc.
 
 @st.cache_data(ttl=60 * 10, show_spinner=False)
-def nba_scoreboard_df(game_date_mmddyyyy: str) -> pd.DataFrame:
-    return scoreboardv2.ScoreboardV2(game_date=game_date_mmddyyyy).get_data_frames()[0]
+def get_today_scoreboard(date_str: str) -> pd.DataFrame:
+    # date_str format: MM/DD/YYYY
+    sb = scoreboardv2.ScoreboardV2(game_date=date_str)
+    games = sb.get_data_frames()[0]  # GameHeader
+    return games
 
-# ----------------------------
-# Autofill helpers
-# ----------------------------
-DEF_TIER = ["Elite (Top 5)", "Good (6-10)", "Average (11-20)", "Weak (21-25)", "Bad (26-30)"]
-PACE_TIER = ["Fast", "Average", "Slow"]
-MARKETS = ["PTS", "REB", "AST", "3PM", "PRA", "PR", "PA", "RA"]
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def get_team_stats(season: str) -> pd.DataFrame:
+    # Team stats includes: DEF_RATING, PACE, NET_RATING, etc.
+    ds = leaguedashteamstats.LeagueDashTeamStats(
+        season=season,
+        season_type_all_star="Regular Season"
+    )
+    df = ds.get_data_frames()[0]
+    # Rank DEF_RATING (lower is better defense)
+    df["DEF_RANK"] = df["DEF_RATING"].rank(method="min", ascending=True).astype(int)
+    # Rank PACE (higher is faster)
+    df["PACE_RANK"] = df["PACE"].rank(method="min", ascending=False).astype(int)
+    return df
 
-def tier_from_rank(rank: Optional[int]) -> Optional[str]:
-    if rank is None:
-        return None
+@st.cache_data(ttl=60 * 15, show_spinner=False)
+def get_player_gamelogs(player_id: int, season: str) -> pd.DataFrame:
+    gl = playergamelog.PlayerGameLog(player_id=player_id, season=season)
+    df = gl.get_data_frames()[0]
+    # df includes: MIN, PTS, REB, AST, FG3M, STL, BLK, TOV, MATCHUP, GAME_DATE
+    # Ensure numeric
+    for c in ["MIN","PTS","REB","AST","FG3M","STL","BLK","TOV"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+# -----------------------------
+# Market math
+# -----------------------------
+MARKETS = {
+    "PTS": lambda r: r["PTS"],
+    "REB": lambda r: r["REB"],
+    "AST": lambda r: r["AST"],
+    "3PM": lambda r: r["FG3M"],
+    "STL": lambda r: r["STL"],
+    "BLK": lambda r: r["BLK"],
+    "TOV": lambda r: r["TOV"],
+    "PR":  lambda r: r["PTS"] + r["REB"],
+    "PA":  lambda r: r["PTS"] + r["AST"],
+    "RA":  lambda r: r["REB"] + r["AST"],
+    "PRA": lambda r: r["PTS"] + r["REB"] + r["AST"],
+}
+
+# How strongly defense/pace should affect each market (0 to 1)
+DEF_COEF = {
+    "PTS": 0.55, "3PM": 0.45, "AST": 0.30, "REB": 0.15,
+    "STL": 0.15, "BLK": 0.10, "TOV": 0.10,
+    "PR": 0.45, "PA": 0.45, "RA": 0.20, "PRA": 0.42
+}
+PACE_COEF = {
+    "PTS": 0.55, "3PM": 0.50, "AST": 0.40, "REB": 0.25,
+    "STL": 0.15, "BLK": 0.10, "TOV": 0.20,
+    "PR": 0.45, "PA": 0.45, "RA": 0.28, "PRA": 0.45
+}
+
+def tier_from_rank(rank: int) -> str:
+    # 30 teams
     if rank <= 5: return "Elite (Top 5)"
-    if rank <= 10: return "Good (6-10)"
-    if rank <= 20: return "Average (11-20)"
-    if rank <= 25: return "Weak (21-25)"
-    return "Bad (26-30)"
+    if rank <= 10: return "Strong (6–10)"
+    if rank <= 20: return "Average (11–20)"
+    if rank <= 25: return "Weak (21–25)"
+    return "Very Weak (26–30)"
 
-def pace_from_rank(rank: Optional[int]) -> Optional[str]:
-    if rank is None:
-        return None
-    if rank <= 10: return "Fast"
-    if rank <= 20: return "Average"
-    return "Slow"
+def pace_tier_from_rank(rank: int) -> str:
+    # rank 1 = fastest
+    if rank <= 5: return "Very Fast (Top 5)"
+    if rank <= 10: return "Fast (6–10)"
+    if rank <= 20: return "Medium (11–20)"
+    if rank <= 25: return "Slow (21–25)"
+    return "Very Slow (26–30)"
 
-def find_player_id(full_name: str) -> Optional[int]:
-    df = nba_players_df()
-    if df.empty:
-        return None
-    name = full_name.strip().lower()
-    exact = df[df["full_name"].str.lower() == name]
-    if not exact.empty:
-        return int(exact.iloc[0]["id"])
-    parts = name.split()
-    if len(parts) >= 2:
-        first, last = parts[0], parts[-1]
-        fuzzy = df[df["full_name"].str.lower().str.contains(first) & df["full_name"].str.lower().str.contains(last)]
-        if not fuzzy.empty:
-            return int(fuzzy.iloc[0]["id"])
-    return None
+def blowout_risk_from_net(team_net: float, opp_net: float) -> str:
+    diff = abs(team_net - opp_net)
+    if diff >= 8: return "High"
+    if diff >= 5: return "Medium"
+    return "Low"
 
-def team_id_to_name(team_id: Optional[int]) -> Optional[str]:
-    if team_id is None:
-        return None
-    tdf = nba_teams_df()
-    if tdf.empty:
-        return None
-    row = tdf[tdf["id"] == team_id]
-    if row.empty:
-        return None
-    return str(row.iloc[0]["full_name"])
+# -----------------------------
+# Session State defaults
+# -----------------------------
+def ss_init(key, value):
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-def infer_team_id_from_gamelog(glog: pd.DataFrame) -> Optional[int]:
-    # Most reliable: parse MATCHUP abbreviation (present in gamelog)
-    if glog is None or glog.empty:
-        return None
-    if "MATCHUP" not in glog.columns:
-        return None
-    # "GSW vs LAL" or "GSW @ LAL" -> first token is player's team abbr
-    abbr = str(glog.iloc[0]["MATCHUP"]).split()[0].strip()
-    tdf = nba_teams_df()
-    if tdf.empty:
-        return None
-    row = tdf[tdf["abbreviation"] == abbr]
-    if row.empty:
-        return None
-    return int(row.iloc[0]["id"])
+ss_init("daily_card", [])  # list of dict results
 
-def find_opponent_team_id_from_scoreboard(team_id: int, game_date_mmddyyyy: str, timeout: float) -> Optional[int]:
-    ok, games, _err = safe_call(nba_scoreboard_df, timeout, game_date_mmddyyyy)
-    if (not ok) or games is None or games.empty:
-        return None
-    row = games[(games["HOME_TEAM_ID"] == team_id) | (games["VISITOR_TEAM_ID"] == team_id)]
-    if row.empty:
-        return None
-    r = row.iloc[0]
-    return int(r["VISITOR_TEAM_ID"]) if int(r["HOME_TEAM_ID"]) == int(team_id) else int(r["HOME_TEAM_ID"])
-
-# ----------------------------
-# Markets + model adjustments
-# ----------------------------
-def market_series(df: pd.DataFrame, market: str) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-
-    if market == "PTS": return pd.to_numeric(df["PTS"], errors="coerce").dropna()
-    if market == "REB": return pd.to_numeric(df["REB"], errors="coerce").dropna()
-    if market == "AST": return pd.to_numeric(df["AST"], errors="coerce").dropna()
-
-    if market == "3PM":
-        col = "FG3M" if "FG3M" in df.columns else None
-        if not col: return pd.Series(dtype=float)
-        return pd.to_numeric(df[col], errors="coerce").dropna()
-
-    need = {
-        "PRA": ["PTS", "REB", "AST"],
-        "PR": ["PTS", "REB"],
-        "PA": ["PTS", "AST"],
-        "RA": ["REB", "AST"],
-    }.get(market)
-
-    if not need: return pd.Series(dtype=float)
-    for c in need:
-        if c not in df.columns:
-            return pd.Series(dtype=float)
-    return pd.to_numeric(df[need].sum(axis=1), errors="coerce").dropna()
-
-def defense_mult(tier: str, side: str) -> float:
-    if side == "Over":
-        return {"Elite (Top 5)": 0.94, "Good (6-10)": 0.97, "Average (11-20)": 1.00, "Weak (21-25)": 1.03, "Bad (26-30)": 1.06}.get(tier, 1.00)
-    return {"Elite (Top 5)": 1.05, "Good (6-10)": 1.02, "Average (11-20)": 1.00, "Weak (21-25)": 0.98, "Bad (26-30)": 0.95}.get(tier, 1.00)
-
-def pace_mult(pace: str) -> float:
-    return {"Fast": 1.03, "Average": 1.00, "Slow": 0.97}.get(pace, 1.00)
-
-def b2b_mult(b2b: str) -> float:
-    return 0.98 if b2b == "Yes" else 1.00
-
-def blowout_mult(risk: str) -> float:
-    return {"Low": 1.00, "Medium": 0.98, "High": 0.95}.get(risk, 1.00)
-
-def usage_mult(bump: str) -> float:
-    return {"None": 1.00, "Small": 1.03, "Medium": 1.06, "Large": 1.10}.get(bump, 1.00)
-
-def sigma_mult(vol: str) -> float:
-    return {"Low": 0.95, "Medium": 1.05, "High": 1.15}.get(vol, 1.05)
-
-# ----------------------------
-# State init
-# ----------------------------
-if "daily_card" not in st.session_state:
-    st.session_state.daily_card = []
-
-# ----------------------------
-# Layout tabs
-# ----------------------------
+# -----------------------------
+# UI
+# -----------------------------
 tab_nba, tab_card, tab_settings = st.tabs(["🏀 NBA", "🧾 Daily Card", "⚙️ Settings"])
 
-# ----------------------------
-# Settings
-# ----------------------------
 with tab_settings:
-    st.subheader("Speed / Reliability")
-    api_timeout = st.slider("NBA API timeout (seconds)", 4, 20, 10, key=k("settings", "api_timeout"))
-    st.caption("AutoFill + Analyze only run when you click them. No background API calls.")
+    st.subheader("Settings (speed/stability)")
+    st.write("These are safe defaults to keep Streamlit fast.")
+    ss_init("api_timeout_note", True)
+    st.caption("Tip: If Streamlit Cloud feels slow, avoid hammering Auto-Fill repeatedly — it caches results for you.")
 
-# ----------------------------
-# NBA tab
-# ----------------------------
-with tab_nba:
-    st.subheader("NBA Prop Analyzer (AutoFill that actually syncs filters)")
-
-    if not NBA_API_AVAILABLE:
-        st.error("nba_api not found. Add 'nba_api' to requirements.txt and redeploy.")
-        st.stop()
-
-    tdf = nba_teams_df()
-    team_names = sorted(tdf["full_name"].tolist()) if not tdf.empty else []
-
-    # Date override (fixes timezone/schedule edge cases)
-    autofill_date = st.date_input("AutoFill date (default = today)", value=date.today(), key=k("nba", "autofill_date"))
-    autofill_mmddyyyy = autofill_date.strftime("%m/%d/%Y")
-
-    # --- AutoFill button ---
-    colA, colB = st.columns([1, 3])
-    with colA:
-        auto_clicked = st.button("⚡ Auto-Fill", key=k("nba", "autofill_btn"))
-    with colB:
-        st.caption("Sets: team override, opponent override, Overall DEF tier, Pace tier (and DvP tier placeholder).")
-
-    if auto_clicked:
-        timeout = float(st.session_state.get(k("settings", "api_timeout"), 10))
-
-        # Pull values the user has typed (even if form not submitted)
-        player_for_fill = st.session_state.get(k("nba", "player_name"), "").strip()
-        season_for_fill = st.session_state.get(k("nba", "season"), "2025-26").strip()
-
-        with st.spinner("Auto-filling opponent + syncing filters..."):
-            pid = find_player_id(player_for_fill)
-            if pid is None:
-                st.error("Player not found. Use full name (e.g., 'Jayson Tatum').")
-            else:
-                ok, glog, err = safe_call(nba_gamelog_df, timeout, pid, season_for_fill)
-                if (not ok) or glog is None or glog.empty:
-                    st.error(f"Could not pull player logs. {err}")
-                else:
-                    if "GAME_DATE" in glog.columns:
-                        glog = glog.sort_values("GAME_DATE", ascending=False)
-
-                    player_team_id = infer_team_id_from_gamelog(glog)
-                    player_team_name = team_id_to_name(player_team_id)
-
-                    opp_team_id = None
-                    opp_team_name = None
-                    if player_team_id is not None:
-                        opp_team_id = find_opponent_team_id_from_scoreboard(player_team_id, autofill_mmddyyyy, timeout)
-                        opp_team_name = team_id_to_name(opp_team_id) if opp_team_id else None
-
-                    # Save for display
-                    st.session_state[k("nba", "autofill_team_id")] = player_team_id
-                    st.session_state[k("nba", "autofill_opp_id")] = opp_team_id
-
-                    # ✅ Write directly into the OVERRIDE dropdown widget states
-                    # (these keys MUST match the selectbox keys in the form below)
-                    if player_team_name and player_team_name in team_names:
-                        st.session_state[k("nba", "team_override")] = player_team_name
-
-                    if opp_team_name and opp_team_name in team_names:
-                        st.session_state[k("nba", "opp_override")] = opp_team_name
-
-                    # Pull opponent ranks (TEAM_ID matching = reliable)
-                    if opp_team_id is not None:
-                        ok2, tctx, err2 = safe_call(nba_team_context_df, timeout, season_for_fill)
-                        if ok2 and tctx is not None and (not tctx.empty):
-                            row = tctx[tctx["TEAM_ID"] == int(opp_team_id)]
-                            if not row.empty:
-                                def_rank = int(row.iloc[0]["DEF_RANK"])
-                                pace_rank = int(row.iloc[0]["PACE_RANK"])
-                                def_tier = tier_from_rank(def_rank)
-                                pace_tier = pace_from_rank(pace_rank)
-
-                                st.session_state[k("nba", "autofill_def_rank")] = def_rank
-                                st.session_state[k("nba", "autofill_pace_rank")] = pace_rank
-
-                                # ✅ Write into the actual filter widget states
-                                if def_tier in DEF_TIER:
-                                    st.session_state[k("nba", "overall_def")] = def_tier
-                                    st.session_state[k("nba", "dvp")] = def_tier  # placeholder; true DvP needs a different feed
-                                if pace_tier in PACE_TIER:
-                                    st.session_state[k("nba", "pace")] = pace_tier
-                        else:
-                            st.warning(f"Could not pull defense/pace ranks right now. {err2}")
-
-                    st.session_state[k("nba", "autofill_status")] = f"Team: {player_team_name or '—'} | Opp: {opp_team_name or '—'} (Date: {autofill_mmddyyyy})"
-
-        # ✅ Force UI to repaint with new dropdown selections
-        st.rerun()
-
-    # --- AutoFill status box ---
-    status = st.session_state.get(k("nba", "autofill_status"), "—")
-    def_rank = st.session_state.get(k("nba", "autofill_def_rank"), None)
-    pace_rank = st.session_state.get(k("nba", "autofill_pace_rank"), None)
-
-    with st.expander("AutoFill status"):
-        st.write(status)
-        if def_rank is not None:
-            st.write(f"Opponent DEF rank: **{def_rank}/30**")
-        if pace_rank is not None:
-            st.write(f"Opponent Pace rank: **{pace_rank}/30**")
-
-    # ----------------------------
-    # Main form (analysis)
-    # ----------------------------
-    with st.form(key=k("nba", "form")):
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            player_name = st.text_input("Player (full name)", value="Stephen Curry", key=k("nba", "player_name"))
-        with col2:
-            season = st.text_input("Season (NBA API format)", value="2025-26", key=k("nba", "season"))
-
-        market = st.selectbox("Market", MARKETS, key=k("nba", "market"))
-        line = st.number_input("Line", value=18.5, step=0.5, key=k("nba", "line"))
-        side = st.selectbox("Pick side", ["Over", "Under"], key=k("nba", "side"))
-        odds_str = st.text_input("Odds (American, optional)", value="-110", key=k("nba", "odds"))
-
-        st.markdown("### Opponent / Overrides")
-        player_team_override = st.selectbox("Player team (override)", ["(auto)"] + team_names, key=k("nba", "team_override"))
-        opp_team_override = st.selectbox("Opponent team (override)", ["(auto)"] + team_names, key=k("nba", "opp_override"))
-
-        st.markdown("### Defense / Pace (AutoFill sets these)")
-        dvp = st.selectbox("Defense vs position (placeholder tier)", DEF_TIER, index=2, key=k("nba", "dvp"))
-        overall_def = st.selectbox("Overall defense", DEF_TIER, index=2, key=k("nba", "overall_def"))
-        pace = st.selectbox("Opponent pace", PACE_TIER, index=1, key=k("nba", "pace"))
-
-        st.markdown("### Minutes / Usage / Risk")
-        expected_minutes = st.number_input("Expected minutes", 0, 48, 34, 1, key=k("nba", "mins"))
-        minutes_vol = st.selectbox("Minutes volatility", ["Low", "Medium", "High"], index=1, key=k("nba", "mins_vol"))
-        usage_bump = st.selectbox("Usage bump", ["None", "Small", "Medium", "Large"], index=0, key=k("nba", "usage"))
-        teammates_out = st.slider("Key teammates OUT (count)", 0, 6, 0, key=k("nba", "tm_out"))
-        b2b = st.selectbox("Back-to-back?", ["No", "Yes"], index=0, key=k("nba", "b2b"))
-        blowout = st.selectbox("Blowout risk", ["Low", "Medium", "High"], index=0, key=k("nba", "blowout"))
-
-        injury_notes = st.text_area("Injury notes (optional)", value="", height=90, key=k("nba", "inj_notes"))
-
-        st.markdown("### Sample / Output")
-        games_recent = st.slider("Recent games used", 5, 30, 15, key=k("nba", "recent_n"))
-        weight_recent = st.slider("Weight recent vs season", 0, 100, 70, key=k("nba", "w_recent"))
-        approved_only = st.checkbox("Show only Approved", value=False, key=k("nba", "approved_only"))
-        add_to_card = st.checkbox("Add to Daily Card", value=True, key=k("nba", "add_card"))
-
-        analyze = st.form_submit_button("Analyze")
-
-    if analyze:
-        timeout = float(st.session_state.get(k("settings", "api_timeout"), 10))
-
-        # Odds parse
-        odds_val = None
-        try:
-            odds_val = int(str(odds_str).strip())
-        except Exception:
-            odds_val = None
-
-        pid = find_player_id(player_name)
-        if pid is None:
-            st.error("Player not found. Use full name.")
-        else:
-            with st.spinner("Pulling logs + analyzing (safe timeout)…"):
-                ok, glog, err = safe_call(nba_gamelog_df, timeout, pid, season)
-            if (not ok) or glog is None or glog.empty:
-                st.error(f"Could not fetch logs. {err}")
-            else:
-                if "GAME_DATE" in glog.columns:
-                    glog = glog.sort_values("GAME_DATE", ascending=False)
-
-                s = market_series(glog, market)
-                if s.empty:
-                    st.error("Could not compute market series from logs.")
-                else:
-                    recent_n = min(int(games_recent), len(s))
-                    recent = s.iloc[:recent_n].astype(float).to_numpy()
-                    season_all = s.astype(float).to_numpy()
-
-                    recent_mean = float(np.mean(recent))
-                    season_mean = float(np.mean(season_all))
-                    w = float(weight_recent) / 100.0
-                    base_mean = w * recent_mean + (1 - w) * season_mean
-
-                    sd = float(np.std(recent, ddof=1)) if len(recent) >= 3 else float(np.std(season_all, ddof=1)) if len(season_all) >= 3 else 3.0
-                    sd = max(sd, 1.0)
-
-                    # Adjustments
-                    adj_mean = base_mean
-                    adj_mean *= defense_mult(dvp, side)
-                    adj_mean *= defense_mult(overall_def, side)
-                    adj_mean *= pace_mult(pace)
-                    adj_mean *= b2b_mult("Yes" if b2b == "Yes" else "No")
-                    adj_mean *= blowout_mult(blowout)
-                    adj_mean *= usage_mult(usage_bump)
-                    adj_mean *= clamp(1.0 + 0.02 * min(teammates_out, 5), 1.0, 1.10)
-                    adj_mean *= clamp(expected_minutes / 34.0, 0.75, 1.25)
-
-                    sd_adj = sd * sigma_mult(minutes_vol)
-
-                    p_o = prob_over(float(line), adj_mean, sd_adj)
-                    p_pick = p_o if side == "Over" else (1 - p_o)
-
-                    implied = american_to_implied_prob(odds_val)
-                    edge = (p_pick - implied) if implied is not None else None
-
-                    # Approval
-                    approved = True
-                    reasons = []
-                    if p_pick < 0.56:
-                        approved = False
-                        reasons.append("Model win% < 56%")
-                    if edge is not None and edge < 0.02:
-                        approved = False
-                        reasons.append("Edge vs implied < 2%")
-                    if blowout == "High" and side == "Over":
-                        approved = False
-                        reasons.append("High blowout risk hurts overs.")
-                    if minutes_vol == "High":
-                        reasons.append("High minutes volatility (risk).")
-
-                    if approved_only and not approved:
-                        st.info("Not Approved (and Approved-only is ON).")
-                    else:
-                        badge = "✅ Approved" if approved else "⚠️ Not Approved"
-                        st.markdown("## Result")
-                        st.subheader(f"{player_name} — {market} {side} {line:.1f}  •  {badge}")
-
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Model win%", f"{p_pick*100:.1f}%")
-                        c2.metric("Adj mean", f"{adj_mean:.2f}")
-                        c3.metric("Adj SD", f"{sd_adj:.2f}")
-
-                        if implied is not None:
-                            st.write(f"**Implied win% ({odds_val}):** {implied*100:.1f}%")
-                        if edge is not None:
-                            st.write(f"**Edge:** {edge*100:.1f}%")
-
-                        st.markdown("### Trend")
-                        st.write(f"- Last {recent_n} avg: **{recent_mean:.2f}**")
-                        st.write(f"- Season avg: **{season_mean:.2f}**")
-                        st.write(f"- Base mean blend: **{base_mean:.2f}**")
-
-                        st.markdown("### Last 10 (most recent first)")
-                        last10 = s.iloc[:10].tolist()
-                        st.write(", ".join([str(int(x)) if float(x).is_integer() else f\{x:.1f}\" for x in last10]))
-
-                        if reasons:
-                            st.markdown("### Flags")
-                            for r in reasons:
-                                st.write(f"- {r}")
-
-                        if injury_notes.strip():
-                            st.markdown("### Injury notes")
-                            st.write(injury_notes.strip())
-
-                        if add_to_card:
-                            st.session_state.daily_card.append({
-                                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                "player": player_name,
-                                "market": market,
-                                "side": side,
-                                "line": float(line),
-                                "odds": odds_val,
-                                "win%": round(p_pick * 100, 1),
-                                "adj_mean": round(adj_mean, 2),
-                                "approved": approved,
-                                "opp_override": opp_team_override,
-                                "overall_def": overall_def,
-                                "pace": pace,
-                            })
-                            st.success("Added to Daily Card ✅")
-
-# ----------------------------
-# Daily Card tab
-# ----------------------------
 with tab_card:
     st.subheader("Daily Card")
-    if not st.session_state.daily_card:
-        st.info("No saved plays yet.")
+    if not st.session_state["daily_card"]:
+        st.info("No saved plays yet. Analyze a prop and check 'Add result to Daily Card' before clicking Analyze.")
     else:
-        df = pd.DataFrame(st.session_state.daily_card)
+        df = pd.DataFrame(st.session_state["daily_card"])
         st.dataframe(df, use_container_width=True)
 
-    if st.button("Clear Card", key=k("card", "clear")):
-        st.session_state.daily_card = []
-        st.success("Cleared ✅")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Clear Daily Card", key="clear_card_btn"):
+                st.session_state["daily_card"] = []
+                st.rerun()
+        with c2:
+            st.download_button(
+                "Download Daily Card (CSV)",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="betlab_daily_card.csv",
+                mime="text/csv",
+                key="dl_card_csv"
+            )
+
+with tab_nba:
+    st.subheader("NBA Prop Analyzer (Auto-Fill syncs defense/pace into the dropdowns)")
+
+    # Core inputs
+    colA, colB = st.columns(2)
+    with colA:
+        player_name = st.text_input("Player (full name)", value="Stephen Curry", key="player_name_in")
+        season = st.selectbox("Season (NBA API format)", ["2025-26", "2024-25", "2023-24"], index=0, key="season_in")
+    with colB:
+        market = st.selectbox("Market", list(MARKETS.keys()), index=0, key="market_in")
+        pick_side = st.selectbox("Pick side", ["Over", "Under"], index=0, key="pick_side_in")
+
+    prop_line = st.number_input("Prop line", value=18.5, step=0.5, key="prop_line_in")
+    odds_str = st.text_input("Odds (optional, American)", value="-110", key="odds_in")
+
+    # Recent/weight controls
+    games_used = st.slider("Games used (recent)", min_value=5, max_value=30, value=15, step=1, key="recent_n_in")
+    weight_recent = st.slider("Weight: recent vs season (0=season, 100=recent)", min_value=0, max_value=100, value=70, step=5, key="weight_recent_in")
+    show_only_approved = st.checkbox("Show only Approved plays", value=False, key="approved_only_in")
+
+    st.divider()
+
+    # Opponent context (AUTO-FILL will set these, but you can override)
+    st.markdown("### Opponent context (auto-fill + override)")
+    ss_init("opp_team_id", None)
+    ss_init("opp_team_name", "")
+    ss_init("your_team_id", None)
+    ss_init("your_team_name", "")
+    ss_init("def_tier", "Average (11–20)")
+    ss_init("pace_tier", "Medium (11–20)")
+    ss_init("blowout_risk", "Low")
+
+    def_tier_options = ["Elite (Top 5)", "Strong (6–10)", "Average (11–20)", "Weak (21–25)", "Very Weak (26–30)"]
+    pace_tier_options = ["Very Fast (Top 5)", "Fast (6–10)", "Medium (11–20)", "Slow (21–25)", "Very Slow (26–30)"]
+    blowout_options = ["Low", "Medium", "High"]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        def_tier = st.selectbox("Overall defense (tier)", def_tier_options, index=def_tier_options.index(st.session_state["def_tier"]), key="def_tier_sb")
+        pace_tier = st.selectbox("Opponent pace (tier)", pace_tier_options, index=pace_tier_options.index(st.session_state["pace_tier"]), key="pace_tier_sb")
+    with c2:
+        blowout_risk = st.selectbox("Blowout risk", blowout_options, index=blowout_options.index(st.session_state["blowout_risk"]), key="blowout_sb")
+        back_to_back = st.selectbox("Back-to-back?", ["No", "Yes"], index=0, key="b2b_sb")
+
+    st.divider()
+
+    # Minutes & usage
+    st.markdown("### Minutes & usage (auto-fill + override)")
+    ss_init("expected_minutes", 34)
+    ss_init("minutes_volatility", "Low")
+    ss_init("usage_bump", "None")
+    ss_init("key_out_count", 0)
+    ss_init("risk_level", "Low")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        expected_minutes = st.number_input("Expected minutes", min_value=0, max_value=48, value=int(st.session_state["expected_minutes"]), step=1, key="exp_min_in")
+        minutes_volatility = st.selectbox("Minutes volatility", ["Low", "Medium", "High"], index=["Low","Medium","High"].index(st.session_state["minutes_volatility"]), key="min_vol_sb")
+    with c4:
+        usage_bump = st.selectbox("Usage bump (injuries/role)", ["None", "Small", "Medium", "Large"], index=["None","Small","Medium","Large"].index(st.session_state["usage_bump"]), key="usage_sb")
+        key_out_count = st.slider("Key teammates OUT (count)", min_value=0, max_value=5, value=int(st.session_state["key_out_count"]), step=1, key="out_cnt_sl")
+
+    risk_level = st.selectbox("Overall risk level", ["Low", "Medium", "High"], index=["Low","Medium","High"].index(st.session_state["risk_level"]), key="risk_sb")
+
+    add_to_card = st.checkbox("Add result to Daily Card after analyze", value=False, key="add_card_cb")
+
+    st.divider()
+
+    # -----------------------------
+    # AUTO-FILL Button
+    # -----------------------------
+    def run_autofill():
+        name = (player_name or "").strip().lower()
+        if not name:
+            st.warning("Type a player name first.")
+            return
+
+        players = get_all_players_df()
+        # Exact match first; fallback to contains
+        exact = players[players["NAME_LOWER"] == name]
+        if exact.empty:
+            contains = players[players["NAME_LOWER"].str.contains(name, na=False)]
+            if contains.empty:
+                st.error("Could not find that player name. Try full name (e.g., 'Stephen Curry').")
+                return
+            pid = int(contains.iloc[0]["PERSON_ID"])
+        else:
+            pid = int(exact.iloc[0]["PERSON_ID"])
+
+        info = get_player_info(pid)
+        if not info or not info.get("TEAM_ID"):
+            st.error("Could not load player team info.")
+            return
+
+        team_id = int(info["TEAM_ID"])
+        team_name = str(info.get("TEAM_NAME", "")).strip()
+        st.session_state["your_team_id"] = team_id
+        st.session_state["your_team_name"] = team_name
+
+        # Today date (US Eastern-ish; Streamlit cloud is UTC, but scoreboard uses date string)
+        # We'll use local date to you; if it misses due to timezone, you can manually override.
+        today = dt.datetime.now().date()
+        date_str = today.strftime("%m/%d/%Y")
+
+        games = get_today_scoreboard(date_str)
+        if games.empty:
+            st.warning(f"No games found for {date_str}. (If games are late, try tomorrow's date manually in code later.)")
+            return
+
+        # Find player's game
+        # Scoreboard GameHeader uses HOME_TEAM_ID / VISITOR_TEAM_ID
+        match = games[(games["HOME_TEAM_ID"] == team_id) | (games["VISITOR_TEAM_ID"] == team_id)]
+        if match.empty:
+            st.warning("Auto-Fill couldn't find this player's team on today's slate.")
+            return
+
+        g = match.iloc[0]
+        home_id = int(g["HOME_TEAM_ID"])
+        vis_id = int(g["VISITOR_TEAM_ID"])
+
+        opp_id = vis_id if home_id == team_id else home_id
+        st.session_state["opp_team_id"] = opp_id
+
+        # Pull team stats (for def/pace tiers)
+        ts = get_team_stats(season)
+        your_row = ts[ts["TEAM_ID"] == team_id]
+        opp_row = ts[ts["TEAM_ID"] == opp_id]
+
+        if not your_row.empty:
+            st.session_state["your_team_name"] = str(your_row.iloc[0]["TEAM_NAME"])
+        if not opp_row.empty:
+            st.session_state["opp_team_name"] = str(opp_row.iloc[0]["TEAM_NAME"])
+
+            opp_def_rank = int(opp_row.iloc[0]["DEF_RANK"])
+            opp_pace_rank = int(opp_row.iloc[0]["PACE_RANK"])
+            st.session_state["def_tier"] = tier_from_rank(opp_def_rank)
+            st.session_state["pace_tier"] = pace_tier_from_rank(opp_pace_rank)
+
+            # Blowout risk from NET_RATING gap
+            if not your_row.empty:
+                team_net = float(your_row.iloc[0]["NET_RATING"])
+                opp_net = float(opp_row.iloc[0]["NET_RATING"])
+                st.session_state["blowout_risk"] = blowout_risk_from_net(team_net, opp_net)
+
+        # Auto-fill expected minutes from recent logs
+        logs = get_player_gamelogs(pid, season)
+        if not logs.empty and "MIN" in logs.columns:
+            recent_min = logs["MIN"].head(10).dropna()
+            if len(recent_min) > 0:
+                st.session_state["expected_minutes"] = int(round(float(recent_min.mean())))
+
+        st.success(
+            f"Auto-Fill set: {st.session_state.get('your_team_name','')} vs "
+            f"{st.session_state.get('opp_team_name','(opponent)')} | "
+            f"DEF: {st.session_state.get('def_tier')} | Pace: {st.session_state.get('pace_tier')}"
+        )
+
+    if st.button("⚡ Auto-Fill (Today)", key="autofill_btn"):
+        with st.spinner("Auto-filling opponent + defense/pace tiers + minutes…"):
+            run_autofill()
+        st.rerun()
+
+    # -----------------------------
+    # Analyze
+    # -----------------------------
+    def analyze_prop():
+        name = (player_name or "").strip().lower()
+        players = get_all_players_df()
+
+        exact = players[players["NAME_LOWER"] == name]
+        if exact.empty:
+            contains = players[players["NAME_LOWER"].str.contains(name, na=False)]
+            if contains.empty:
+                return None, "Player not found. Use full name."
+            player_id = int(contains.iloc[0]["PERSON_ID"])
+            display_name = str(contains.iloc[0]["DISPLAY_FIRST_LAST"])
+        else:
+            player_id = int(exact.iloc[0]["PERSON_ID"])
+            display_name = str(exact.iloc[0]["DISPLAY_FIRST_LAST"])
+
+        logs = get_player_gamelogs(player_id, season)
+        if logs.empty:
+            return None, "No game logs returned for that season."
+
+        # Build stat series for selected market
+        if market not in MARKETS:
+            return None, "Invalid market."
+
+        vals = logs.apply(MARKETS[market], axis=1).astype(float)
+        vals = vals.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if len(vals) < 8:
+            return None, "Not enough games to model (need ~8+)."
+
+        season_mean = float(vals.mean())
+        season_std = float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+
+        recent_vals = vals.head(games_used)
+        recent_mean = float(recent_vals.mean())
+        recent_std = float(recent_vals.std(ddof=1)) if len(recent_vals) > 1 else season_std
+
+        w = weight_recent / 100.0
+        base_mu = (1 - w) * season_mean + w * recent_mean
+        base_sigma = max(0.75, (1 - w) * season_std + w * recent_std)  # floor for stability
+
+        # Minutes scale
+        mins = logs["MIN"].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+        base_min = float(mins.mean()) if len(mins) else float(expected_minutes)
+        min_scale = (float(expected_minutes) / base_min) if base_min > 1 else 1.0
+
+        # Defense & pace adjustments (using tiers as proxies)
+        # Convert tier to numeric multiplier around 1.0
+        def_mult_map = {
+            "Elite (Top 5)": 0.92,
+            "Strong (6–10)": 0.96,
+            "Average (11–20)": 1.00,
+            "Weak (21–25)": 1.04,
+            "Very Weak (26–30)": 1.08
+        }
+        pace_mult_map = {
+            "Very Fast (Top 5)": 1.06,
+            "Fast (6–10)": 1.03,
+            "Medium (11–20)": 1.00,
+            "Slow (21–25)": 0.97,
+            "Very Slow (26–30)": 0.94
+        }
+
+        dcoef = DEF_COEF.get(market, 0.35)
+        pcoef = PACE_COEF.get(market, 0.35)
+
+        def_mult = 1.0 + (def_mult_map.get(def_tier, 1.0) - 1.0) * dcoef
+        pace_mult = 1.0 + (pace_mult_map.get(pace_tier, 1.0) - 1.0) * pcoef
+
+        # Usage bump (manual)
+        usage_map = {"None": 1.00, "Small": 1.03, "Medium": 1.06, "Large": 1.10}
+        usage_mult = usage_map.get(usage_bump, 1.00)
+
+        # Back-to-back penalty (light)
+        b2b_mult = 0.98 if back_to_back == "Yes" else 1.00
+
+        # Blowout risk reduces minutes/ceiling a bit
+        blow_map = {"Low": 1.00, "Medium": 0.985, "High": 0.97}
+        blow_mult = blow_map.get(blowout_risk, 1.00)
+
+        mu = base_mu * min_scale * def_mult * pace_mult * usage_mult * b2b_mult * blow_mult
+
+        # Sigma scaled softly with minutes volatility / blowout
+        vol_map = {"Low": 1.00, "Medium": 1.08, "High": 1.18}
+        sigma = base_sigma * vol_map.get(minutes_volatility, 1.00) * (1.05 if blowout_risk == "High" else 1.00)
+
+        line = float(prop_line)
+
+        # Probability
+        if pick_side == "Over":
+            prob = 1.0 - normal_cdf(line, mu, sigma)
+        else:
+            prob = normal_cdf(line, mu, sigma)
+
+        prob = max(0.0, min(1.0, prob))
+
+        # Odds & “approved” logic
+        try:
+            odds_int = int(str(odds_str).strip())
+        except Exception:
+            odds_int = None
+
+        implied = american_to_implied_prob(odds_int) if odds_int is not None else None
+        edge = (prob - implied) if implied is not None else None
+
+        # Conservative approval threshold if odds missing
+        # For -110-ish, breakeven ~52.4%. We'll require 56% unless user wants looser.
+        approved = (prob >= 0.56) if implied is None else (edge >= 0.03)
+
+        # Build output dict
+        out = {
+            "Player": display_name,
+            "Season": season,
+            "Market": market,
+            "Pick": pick_side,
+            "Line": line,
+            "Prob%": round(prob * 100, 1),
+            "Approved": "✅" if approved else "—",
+            "SeasonAvg": round(season_mean, 2),
+            "RecentAvg": round(recent_mean, 2),
+            "ModelMean": round(mu, 2),
+            "ModelStd": round(sigma, 2),
+            "ExpMin": int(expected_minutes),
+            "DEF Tier": def_tier,
+            "Pace Tier": pace_tier,
+            "B2B": back_to_back,
+            "Blowout": blowout_risk,
+            "Odds": odds_int if odds_int is not None else "",
+            "Implied%": round(implied * 100, 1) if implied is not None else "",
+            "Edge%": round(edge * 100, 1) if edge is not None else "",
+        }
+        return out, None
+
+    if st.button("Analyze NBA", key="analyze_btn"):
+        with st.spinner("Crunching season + recent + variance + context…"):
+            result, err = analyze_prop()
+
+        if err:
+            st.error(err)
+        else:
+            # If "approved only" is checked and it's not approved, hide it
+            if show_only_approved and result["Approved"] != "✅":
+                st.warning("Not Approved under your filter. (Toggle off 'Show only Approved plays' to view.)")
+            else:
+                st.success("Analysis complete ✅")
+                st.dataframe(pd.DataFrame([result]), use_container_width=True)
+
+                st.markdown("#### Quick read")
+                st.write(
+                    f"**{result['Player']}** — **{result['Pick']} {result['Market']} {result['Line']}** "
+                    f"→ Model prob **{result['Prob%']}%** | Model mean **{result['ModelMean']}** "
+                    f"(Season {result['SeasonAvg']} / Recent {result['RecentAvg']})"
+                )
+
+                if add_to_card:
+                    st.session_state["daily_card"].append(result)
+                    st.toast("Added to Daily Card ✅", icon="🧾")
