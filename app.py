@@ -345,7 +345,6 @@ if auto_fill_clicked:
                             pace_rank = int(row.iloc[0]["PACE_RANK"])
                             def_tier = tier_from_rank(def_rank)
                             pace_tier = pace_from_rank(pace_rank)
-
                             st.session_state[k("nba", "autofill_def_rank")] = def_rank
                             st.session_state[k("nba", "autofill_pace_rank")] = pace_rank
 
