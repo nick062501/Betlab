@@ -6,7 +6,16 @@ import streamlit as st
 from nba_api.stats.endpoints import playergamelog
 from nba_api.stats.static import players as nba_players
 import nfl_data_py as nfl
-
+# -----------------------------
+# Defense vs Position modifiers
+# -----------------------------
+DEFENSE_MODIFIERS = {
+    "Elite": 0.92,      # top 5 defense vs position
+    "Above Avg": 0.96,  # top 6–10
+    "Average": 1.00,    # 11–20
+    "Below Avg": 1.05,  # 21–25
+    "Poor": 1.10        # 26–30
+}
 # -----------------------------
 # Math helpers (NO scipy)
 # -----------------------------
