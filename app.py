@@ -44,9 +44,13 @@ with tab1:
     player = st.text_input("Player", "Stephen Curry")
     season = st.text_input("Season", "2025-26")
     market = st.selectbox("Market", ["PTS", "REB", "AST", "PRA"])
-    line = st.number_input("Line", 18.5, step=0.5)
-    side = st.selectbox("Pick", ["Over", "Under"])
+line = st.number_input("Line", 18.5, step=0.5)
+side = st.selectbox("Pick", ["Over", "Under"])
 
+defense_tier = st.selectbox(
+    "Opponent Defense vs Position",
+    ["Elite", "Above Avg", "Average", "Below Avg", "Poor"]
+)
     if st.button("Analyze NBA"):
         pid = nba_players.find_players_by_full_name(player)
         if not pid:
@@ -62,9 +66,11 @@ with tab1:
                 df["PTS"] + df["REB"] + df["AST"]
             )
 
-            mean = series.head(10).mean()
-            std = max(series.head(10).std(), 3.0)
+            base_mean = series.head(10).mean()
+std = max(series.head(10).std(), 3.0)
 
+def_mod = DEFENSE_MODIFIERS[defense_tier]
+mean = base_mean * def_mod
             pu, po = normal_over_under(mean, std, line)
             prob = pu if side == "Under" else po
 
